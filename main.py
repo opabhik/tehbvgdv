@@ -208,7 +208,6 @@ async def process_download(event, url):
                     nosound=False
                 )
             ],
-            # Optimize upload settings
             part_size=1024*1024,  # 1MB chunks for upload
             force_document=False   # Send as video, not file
         )
@@ -236,14 +235,10 @@ async def main():
             API_ID,
             API_HASH,
             base_logger=logger,
-            connection_retries=5,
-            auto_reconnect=True
+            connection_retries=5
         )
         
-        await client.start(
-            bot_token=BOT_TOKEN,
-            max_retries=5
-        )
+        await client.start(bot_token=BOT_TOKEN)
         logger.info("Bot started successfully")
         
         # Track active downloads to prevent duplicate processing
