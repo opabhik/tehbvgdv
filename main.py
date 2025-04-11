@@ -6,12 +6,14 @@ from urllib.parse import urlparse
 from pymongo import MongoClient
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, types
+from telethon.tl.functions.messages import ImportChatInviteRequest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 import logging
 import mimetypes
 import math
 from datetime import datetime, timedelta
+import signal
 
 # Configure logging
 logging.basicConfig(
@@ -30,6 +32,7 @@ try:
     BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
     MONGODB_URI = os.getenv("MONGODB_URI")
     ADMIN_CHANNEL = os.getenv("ADMIN_CHANNEL")  # Channel username or ID
+    ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
     
     if not all([API_ID, API_HASH, BOT_TOKEN, MONGODB_URI]):
         raise ValueError("Missing required environment variables")
@@ -37,17 +40,33 @@ except Exception as e:
     logger.error(f"Configuration error: {str(e)}")
     raise
 
+# Global state
+RESTARTING = False
+SHUTDOWN = False
+ACTIVE_DOWNLOADS = {}
+
 # Health check server
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
+        if SHUTDOWN:
+            self.send_response(503)
+            self.end_headers()
+            self.wfile.write(b"Service shutting down")
+        elif RESTARTING:
+            self.send_response(503)
+            self.end_headers()
+            self.wfile.write(b"Service restarting")
+        else:
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
 
 def start_health_server():
     server = HTTPServer(("0.0.0.0", 8000), HealthCheckHandler)
     logger.info("Health check server running on port 8000")
-    server.serve_forever()
+    while not SHUTDOWN:
+        server.handle_request()
+    server.server_close()
 
 # Start health check server in background
 health_thread = threading.Thread(target=start_health_server, daemon=True)
@@ -59,20 +78,30 @@ try:
     mongo_client.server_info()  # Test connection
     db = mongo_client.get_database("telegram_bot")
     downloads_collection = db.downloads
+    users_collection = db.users
     logger.info("Connected to MongoDB")
 except Exception as e:
     logger.error(f"MongoDB connection error: {str(e)}")
     raise
 
 async def log_download(user_id, url, filename, size, status):
-    downloads_collection.insert_one({
+    download_data = {
         "user_id": user_id,
         "url": url,
         "filename": filename,
-        "size_mb": size / (1024 * 1024),
+        "size_mb": size / (1024 * 1024) if size > 0 else 0,
         "timestamp": time.time(),
         "status": status
-    })
+    }
+    downloads_collection.insert_one(download_data)
+    
+    # Update user info
+    users_collection.update_one(
+        {"user_id": user_id},
+        {"$set": {"last_active": time.time()}, "$inc": {"download_count": 1}},
+        upsert=True
+    )
+    return download_data
 
 def get_progress_bar(percent):
     filled = '⬢' * int(percent / 5)
@@ -92,7 +121,7 @@ def format_eta(seconds):
     else:
         return f"{int(seconds/3600)}h {int((seconds%3600)/60)}m"
 
-async def download_file(url, filename, progress_callback=None):
+async def download_file(url, filename, progress_callback=None, cancel_event=None):
     session = requests.Session()
     adapter = requests.adapters.HTTPAdapter(
         pool_connections=50,
@@ -115,14 +144,16 @@ async def download_file(url, filename, progress_callback=None):
 
     with open(filename, 'wb') as f:
         for data in response.iter_content(block_size):
+            if cancel_event and cancel_event.is_set():
+                raise asyncio.CancelledError("Download cancelled by restart")
+                
             f.write(data)
             downloaded += len(data)
             
             current_time = time.time()
             elapsed = current_time - last_update
             
-            # Update at least once per second
-            if elapsed >= 1:
+            if elapsed >= 1:  # Update at least once per second
                 current_speed = (downloaded / (1024 * 1024)) / (current_time - start_time)
                 speeds.append(current_speed)
                 if len(speeds) > 5:
@@ -169,9 +200,14 @@ async def create_progress_message(file_info, progress_data, phase="download"):
     speed = format_speed(progress_data['speed'])
     eta = format_eta(progress_data['eta'])
     
+    if phase == "download":
+        phase_text = "⬇️ Downloading"
+    else:
+        phase_text = "📤 Uploading"
+    
     message = (
         f"<b>📁 {title}</b>\n\n"
-        f"<b>⬇️ Downloading:</b> <code>{progress_data['filename']}</code>\n"
+        f"<b>{phase_text}:</b> <code>{progress_data['filename']}</code>\n"
         f"<b>📦 Size:</b> <code>{progress_data['downloaded']//(1024*1024)}MB / {progress_data['total']//(1024*1024)}MB</code>\n"
         f"<b>🚀 Speed:</b> <code>{speed}</code>\n"
         f"<b>⏳ ETA:</b> <code>{eta}</code>\n\n"
@@ -182,18 +218,43 @@ async def create_progress_message(file_info, progress_data, phase="download"):
     return message
 
 async def process_download(event, url):
+    global ACTIVE_DOWNLOADS
+    
     user_id = event.sender_id
     processing_msg = None
+    thumbnail_msg = None
     temp_filename = None
     last_update = time.time()
     file_info = None
+    cancel_event = asyncio.Event()
     
     try:
+        # Register active download
+        download_id = f"{user_id}_{time.time()}"
+        ACTIVE_DOWNLOADS[download_id] = {
+            'event': event,
+            'cancel': cancel_event,
+            'start_time': time.time()
+        }
+        
         # Get file info
         file_info = await get_terabox_info(url)
         if not file_info or not file_info['hd_url']:
             await event.reply("❌ Could not get download link")
             return
+
+        # Send thumbnail as separate photo message
+        if file_info.get('thumbnail'):
+            try:
+                thumbnail_msg = await event.client.send_message(
+                    event.chat_id,
+                    "🔄 <b>Processing your download request...</b>",
+                    file=file_info['thumbnail'],
+                    parse_mode='html'
+                )
+            except Exception as e:
+                logger.error(f"Error sending thumbnail: {str(e)}")
+                thumbnail_msg = await event.reply("🔄 Processing your download request...", parse_mode='html')
 
         # Create initial processing message
         processing_data = {
@@ -204,18 +265,6 @@ async def process_download(event, url):
             'eta': 0
         }
         progress_msg = await create_progress_message(file_info, processing_data)
-        
-        # Send thumbnail as separate message if available
-        if file_info.get('thumbnail'):
-            try:
-                await event.client.send_message(
-                    event.chat_id,
-                    "🔄 Processing your download request...",
-                    file=file_info['thumbnail']
-                )
-            except Exception as e:
-                logger.error(f"Error sending thumbnail: {str(e)}")
-
         processing_msg = await event.reply(progress_msg, parse_mode='html')
 
         title = file_info['title']
@@ -237,7 +286,7 @@ async def process_download(event, url):
         temp_filename = f"temp_{filename}"
 
         # Download with progress
-        await log_download(user_id, url, filename, file_size, 'downloading')
+        download_data = await log_download(user_id, url, filename, file_size, 'downloading')
         
         async def progress_callback(filename, downloaded, total, speed, eta):
             nonlocal last_update
@@ -257,7 +306,7 @@ async def process_download(event, url):
                     logger.error(f"Error updating progress: {str(e)}")
                 last_update = current_time
 
-        file_size = await download_file(hd_url, temp_filename, progress_callback)
+        file_size = await download_file(hd_url, temp_filename, progress_callback, cancel_event)
         await log_download(user_id, url, filename, file_size, 'downloaded')
 
         # Upload with progress
@@ -290,8 +339,21 @@ async def process_download(event, url):
                 )
                 last_upload_update = current_time
 
+        # Update message before starting upload
+        initial_upload_msg = await create_progress_message(
+            file_info,
+            {
+                'filename': filename,
+                'downloaded': 0,
+                'total': file_size,
+                'speed': 0,
+                'eta': 0
+            },
+            "upload"
+        )
+        await processing_msg.edit(initial_upload_msg, parse_mode='html')
+        
         # Upload the file
-        await processing_msg.edit("📤 Starting upload...", parse_mode='html')
         uploaded_file = await event.client.send_file(
             event.chat_id,
             temp_filename,
@@ -327,7 +389,20 @@ async def process_download(event, url):
         
         upload_time = time.time() - upload_start
         upload_speed = file_size / (1024 * 1024) / upload_time if upload_time > 0 else 0
-        await processing_msg.edit(
+        
+        # Delete progress messages
+        if thumbnail_msg:
+            try:
+                await thumbnail_msg.delete()
+            except:
+                pass
+        try:
+            await processing_msg.delete()
+        except:
+            pass
+        
+        # Send final completion message
+        await event.reply(
             f"✅ <b>Upload Complete!</b>\n\n"
             f"📁 <b>File:</b> <code>{filename}</code>\n"
             f"📊 <b>Size:</b> <code>{file_size//(1024*1024)} MB</code>\n"
@@ -337,6 +412,10 @@ async def process_download(event, url):
         )
         await log_download(user_id, url, filename, file_size, 'uploaded')
 
+    except asyncio.CancelledError:
+        await event.reply("❌ Download was cancelled due to bot restart")
+        if temp_filename:
+            await log_download(user_id, url, temp_filename, 0, 'cancelled')
     except Exception as e:
         error_msg = f"❌ <b>Error:</b> <code>{str(e)}</code>"
         if processing_msg:
@@ -349,8 +428,92 @@ async def process_download(event, url):
     finally:
         if temp_filename and os.path.exists(temp_filename):
             os.remove(temp_filename)
+        if download_id in ACTIVE_DOWNLOADS:
+            del ACTIVE_DOWNLOADS[download_id]
+
+async def broadcast_message(client, message):
+    try:
+        users = users_collection.distinct("user_id")
+        success = 0
+        failed = 0
+        
+        for user_id in users:
+            try:
+                await client.send_message(user_id, message, parse_mode='html')
+                success += 1
+                await asyncio.sleep(0.5)  # Rate limiting
+            except Exception as e:
+                logger.error(f"Failed to send to {user_id}: {str(e)}")
+                failed += 1
+                
+        return success, failed
+    except Exception as e:
+        logger.error(f"Broadcast error: {str(e)}")
+        return 0, 0
+
+async def cleanup_temp_files():
+    for filename in os.listdir():
+        if filename.startswith('temp_'):
+            try:
+                os.remove(filename)
+                logger.info(f"Cleaned up temp file: {filename}")
+            except Exception as e:
+                logger.error(f"Error cleaning up temp file {filename}: {str(e)}")
+
+async def cancel_active_downloads():
+    global ACTIVE_DOWNLOADS
+    
+    for download_id, download_info in list(ACTIVE_DOWNLOADS.items()):
+        try:
+            download_info['cancel'].set()
+            logger.info(f"Cancelled download {download_id}")
+        except Exception as e:
+            logger.error(f"Error cancelling download {download_id}: {str(e)}")
+
+async def clear_temp_data():
+    try:
+        # Clear downloads collection but keep user data
+        result = downloads_collection.delete_many({})
+        logger.info(f"Cleared {result.deleted_count} download records")
+        
+        # Clean up temp files
+        await cleanup_temp_files()
+        
+        return True
+    except Exception as e:
+        logger.error(f"Error clearing temp data: {str(e)}")
+        return False
+
+async def restart_bot(client):
+    global RESTARTING
+    
+    try:
+        RESTARTING = True
+        
+        # Notify active users
+        for download_id, download_info in list(ACTIVE_DOWNLOADS.items()):
+            try:
+                await download_info['event'].reply("⚠️ Bot is restarting. Your download will be cancelled.")
+            except Exception as e:
+                logger.error(f"Error notifying user {download_id}: {str(e)}")
+        
+        # Cancel active downloads
+        await cancel_active_downloads()
+        
+        # Clear temporary data
+        await clear_temp_data()
+        
+        # Restart the bot
+        logger.info("Restarting bot...")
+        os.execl(sys.executable, sys.executable, *sys.argv)
+        
+    except Exception as e:
+        logger.error(f"Error during restart: {str(e)}")
+        RESTARTING = False
 
 async def main():
+    global RESTARTING, SHUTDOWN
+    
     try:
         logger.info("Starting Telegram bot...")
         
@@ -367,51 +530,168 @@ async def main():
         await client.start(bot_token=BOT_TOKEN)
         logger.info("Bot started successfully")
         
-        # Track active downloads per user (not globally)
-        user_active_downloads = {}
-        
         @client.on(events.NewMessage(pattern='/start'))
         async def start_handler(event):
+            if RESTARTING:
+                await event.reply("🔄 Bot is currently restarting. Please try again shortly.")
+                return
+                
             await event.reply(
                 "🌟 <b>TeraBox Downloader Bot</b> 🌟\n\n"
                 "Send me a TeraBox link to download and upload as video.\n\n"
                 "⚡ <i>Fast downloads | HD quality | Progress tracking</i>\n"
-                "🔹 <i>Multiple parallel downloads supported</i>",
+                "🔹 <i>Multiple parallel downloads supported</i>\n\n"
+                "Type /help for commands",
                 parse_mode='html'
             )
+            
+        @client.on(events.NewMessage(pattern='/help'))
+        async def help_handler(event):
+            help_text = (
+                "📜 <b>Available Commands:</b>\n\n"
+                "/start - Start the bot\n"
+                "/help - Show this help message\n"
+                "/stats - Show your download stats\n"
+                "/broadcast - (Admin only) Send message to all users\n"
+                "/restart - (Admin only) Restart the bot\n\n"
+                "📌 Just send a TeraBox link to start downloading"
+            )
+            await event.reply(help_text, parse_mode='html')
             
         @client.on(events.NewMessage(pattern='/stats'))
         async def stats_handler(event):
+            if RESTARTING:
+                await event.reply("🔄 Bot is currently restarting. Please try again shortly.")
+                return
+                
             user_id = event.sender_id
             count = downloads_collection.count_documents({"user_id": user_id})
+            active_count = len([d for d in ACTIVE_DOWNLOADS.values() if d['event'].sender_id == user_id])
+            
             await event.reply(
                 f"📊 <b>Your Download Stats</b>\n\n"
                 f"📂 <b>Total Files:</b> <code>{count}</code>\n"
-                f"🔄 <b>Active Downloads:</b> <code>{len(user_active_downloads.get(user_id, []))}</code>",
+                f"🔄 <b>Active Downloads:</b> <code>{active_count}</code>",
                 parse_mode='html'
             )
             
+        @client.on(events.NewMessage(pattern='/broadcast'))
+        async def broadcast_handler(event):
+            if event.sender_id not in ADMIN_IDS:
+                await event.reply("❌ You are not authorized to use this command.")
+                return
+                
+            if RESTARTING:
+                await event.reply("🔄 Bot is currently restarting. Please try again shortly.")
+                return
+                
+            if event.is_reply:
+                reply = await event.get_reply_message()
+                message = reply.text
+            else:
+                parts = event.text.split(' ', 1)
+                if len(parts) < 2:
+                    await event.reply("ℹ️ Usage: /broadcast <message> or reply to a message")
+                    return
+                message = parts[1]
+                
+            confirm = await event.reply(
+                f"⚠️ <b>Are you sure you want to broadcast this message to all users?</b>\n\n"
+                f"{message}\n\n"
+                f"Type /confirm_broadcast to proceed or /cancel to abort",
+                parse_mode='html'
+            )
+            
+        @client.on(events.NewMessage(pattern='/confirm_broadcast'))
+        async def confirm_broadcast_handler(event):
+            if event.sender_id not in ADMIN_IDS:
+                return
+                
+            if RESTARTING:
+                await event.reply("🔄 Bot is currently restarting. Please try again shortly.")
+                return
+                
+            reply = await event.get_reply_message()
+            if not reply or not reply.text.startswith("⚠️ <b>Are you sure"):
+                await event.reply("❌ Please reply to the broadcast confirmation message.")
+                return
+                
+            message = '\n'.join(reply.text.split('\n')[3:-2])  # Extract the message
+            await event.reply("📢 Starting broadcast... This may take some time.")
+            
+            success, failed = await broadcast_message(client, message)
+            
+            await event.reply(
+                f"✅ Broadcast completed!\n\n"
+                f"✓ Success: {success}\n"
+                f"✗ Failed: {failed}",
+                parse_mode='html'
+            )
+            
+        @client.on(events.NewMessage(pattern='/restart'))
+        async def restart_handler(event):
+            global RESTARTING
+            
+            if event.sender_id not in ADMIN_IDS:
+                await event.reply("❌ You are not authorized to use this command.")
+                return
+                
+            if RESTARTING:
+                await event.reply("🔄 Bot is already restarting.")
+                return
+                
+            confirm = await event.reply(
+                "⚠️ <b>Are you sure you want to restart the bot?</b>\n\n"
+                "This will:\n"
+                "1. Stop all active downloads\n"
+                "2. Clear temporary download data\n"
+                "3. Restart the bot\n\n"
+                "Type /confirm_restart to proceed or /cancel to abort",
+                parse_mode='html'
+            )
+            
+        @client.on(events.NewMessage(pattern='/confirm_restart'))
+        async def confirm_restart_handler(event):
+            if event.sender_id not in ADMIN_IDS:
+                return
+                
+            reply = await event.get_reply_message()
+            if not reply or not reply.text.startswith("⚠️ <b>Are you sure"):
+                await event.reply("❌ Please reply to the restart confirmation message.")
+                return
+                
+            await event.reply("🔄 Starting restart process...")
+            await restart_bot(client)
+            
+        @client.on(events.NewMessage(pattern='/cancel'))
+        async def cancel_handler(event):
+            if event.is_reply:
+                reply = await event.get_reply_message()
+                if reply.from_id == (await client.get_me()).id:
+                    await event.reply("✅ Operation cancelled")
+                    return
+            await event.reply("ℹ️ No operation to cancel")
+            
         @client.on(events.NewMessage())
         async def message_handler(event):
+            if RESTARTING:
+                await event.reply("🔄 Bot is currently restarting. Please try again shortly.")
+                return
+                
             if not event.text or 'http' not in event.text.lower():
                 return
                 
             user_id = event.sender_id
-            if user_id not in user_active_downloads:
-                user_active_downloads[user_id] = []
-                
-            if event.text in user_active_downloads[user_id]:
-                await event.reply("🔄 This link is already being processed. Please wait.")
-                return
-                
-            try:
-                user_active_downloads[user_id].append(event.text)
-                await process_download(event, event.text)
-            except Exception as e:
-                logger.error(f"Error in message_handler: {str(e)}")
-            finally:
-                if event.text in user_active_downloads.get(user_id, []):
-                    user_active_downloads[user_id].remove(event.text)
+            url = event.text.strip()
+            
+            # Check if user already has this URL in progress
+            for download_id, download_info in ACTIVE_DOWNLOADS.items():
+                if (download_info['event'].sender_id == user_id and 
+                    download_info['event'].text.strip() == url):
+                    await event.reply("🔄 This link is already being processed. Please wait.")
+                    return
+            
+            await process_download(event, url)
         
         logger.info("Bot is ready and listening...")
         await client.run_until_disconnected()
@@ -420,13 +700,15 @@ async def main():
         logger.error(f"Bot failed to start: {str(e)}")
         raise
     finally:
+        SHUTDOWN = True
         if 'client' in locals():
             await client.disconnect()
         mongo_client.close()
+        logger.info("Bot shutdown complete")
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except Exception as e:
         logger.error(f"Fatal error: {str(e)}")
-        time.sleep(3)
+        time.sleep(5)
