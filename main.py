@@ -1,197 +1,109 @@
-import os
-import requests
-import time
+from telethon import TelegramClient, events
 import asyncio
-from telegram import Update, InputFile
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-    CallbackQueryHandler
-)
-from urllib.parse import urlparse
-from pymongo import MongoClient
-from dotenv import load_dotenv
-import logging
-from aiohttp import web
+import re
+import requests
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 
-# Configure logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# Healthcheck server
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
 
-# Load environment variables
-load_dotenv()
+def start_dummy_server():
+    server = HTTPServer(("0.0.0.0", 8000), HealthCheckHandler)
+    server.serve_forever()
 
-# Configuration
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-API_ID = os.getenv("TELEGRAM_API_ID")
-API_HASH = os.getenv("TELEGRAM_API_HASH")
-MONGODB_URI = os.getenv("MONGODB_URI")
-MAX_FILE_SIZE = 2000 * 1024 * 1024  # 2GB (Telegram client API limit)
+threading.Thread(target=start_dummy_server, daemon=True).start()
 
-# MongoDB connection
-client = MongoClient(MONGODB_URI)
-db = client.get_database("telegram_bot")
-downloads_collection = db.downloads
+# Telegram credentials
+api_id = 28241713
+api_hash = '7ef0b559f6048c1396aa3d285665fbca'
+client = TelegramClient('session', api_id, api_hash)
 
-async def health_check(request):
-    return web.Response(text="OK")
+# Settings
+CHANNEL_USERNAME = 'twsthsush'  # Channel username without @
+JSON_URL = 'https://opabhik.serv00.net/track/data.json'  # JSON file URL
+DELETE_API_URL = 'https://opabhik.serv00.net/track/delete.php?msg_id='  # Delete URL
+ADMIN_ID = 1562465522  # Your Telegram user ID
 
-def run_health_check():
-    app = web.Application()
-    app.router.add_get('/health', health_check)
-    web.run_app(app, port=8000)
+@client.on(events.NewMessage)
+async def handle_message(event):
+    message = event.message.message.lower()
+    if message == "hi":
+        await event.reply("✅")
 
-def start_health_check_server():
-    thread = threading.Thread(target=run_health_check)
-    thread.daemon = True
-    thread.start()
-
-async def log_download(user_id, url, filename, size):
-    downloads_collection.insert_one({
-        "user_id": user_id,
-        "url": url,
-        "filename": filename,
-        "size_mb": size / (1024 * 1024),
-        "timestamp": time.time(),
-        "status": "completed"
-    })
-
-async def download_file_with_progress(url, filename, msg):
-    response = requests.get(url, stream=True)
-    response.raise_for_status()
-
-    total_size = int(response.headers.get('content-length', 0))
-    block_size = 1024 * 1024  # 1MB chunks
-    downloaded = 0
-    last_update = time.time()
-
-    with open(filename, 'wb') as f:
-        for data in response.iter_content(block_size):
-            f.write(data)
-            downloaded += len(data)
-            
-            # Update progress every 5 seconds
-            if time.time() - last_update > 5:
-                percent = (downloaded / total_size) * 100
-                speed = downloaded / (1024 * 1024) / (time.time() - last_update)
-                await msg.edit_text(
-                    f"⬇️ Downloading: {filename}\n"
-                    f"Progress: {downloaded//(1024*1024)}MB / {total_size//(1024*1024)}MB\n"
-                    f"Speed: {speed:.1f} MB/s"
-                )
-                last_update = time.time()
-
-    return total_size
-
-async def upload_large_file(update, filename, caption):
+async def notify_admin(text):
     try:
-        # Using client API for larger files
-        await update.message.reply_document(
-            document=InputFile(filename),
-            caption=caption,
-            filename=os.path.basename(filename),
-            read_timeout=300,
-            write_timeout=300,
-            connect_timeout=300
-        )
-        return True
+        await client.send_message(ADMIN_ID, text)
     except Exception as e:
-        logging.error(f"Upload failed: {str(e)}")
-        return False
+        print(f"Error sending message to admin: {e}")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text('Welcome! Send me a TeraBox link to download and upload to Telegram.')
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.text:
-        return
-
-    message_text = update.message.text
-    user_id = update.message.from_user.id
-
-    if 'http' not in message_text.lower():
-        await update.message.reply_text("Please send a valid HTTP URL")
-        return
-
-    processing_msg = await update.message.reply_text('🔍 Processing your link...')
-
-    try:
-        # Get file info from API
-        api_url = f"https://true12g.in/api/terabox.php?url={message_text}"
-        response = requests.get(api_url, timeout=30)
-        data = response.json()
-
-        if not data.get('response'):
-            await processing_msg.edit_text("❌ No valid data found in the API response.")
-            return
-
-        item = data['response'][0]
-        title = item.get('title', 'Untitled')
-        hd_url = item['resolutions'].get('HD Video', '')
-
-        if not hd_url:
-            await processing_msg.edit_text("❌ No download link found.")
-            return
-
-        # Check file size
-        head_response = requests.head(hd_url)
-        file_size = int(head_response.headers.get('content-length', 0))
-        
-        if file_size > MAX_FILE_SIZE:
-            await processing_msg.edit_text(
-                f"⚠️ File is too large ({file_size//(1024*1024)}MB). "
-                f"Max supported size is {MAX_FILE_SIZE//(1024*1024)}MB."
-            )
-            return
-
-        filename = os.path.basename(urlparse(hd_url).path) or f"file_{int(time.time())}.mp4"
-        temp_filename = f"temp_{filename}"
-
-        # Download file
-        await processing_msg.edit_text(f"⬇️ Starting download: {filename}")
+async def check_posts():
+    while True:
         try:
-            file_size = await download_file_with_progress(hd_url, temp_filename, processing_msg)
-            await log_download(user_id, hd_url, filename, file_size)
+            print("Checking posts...")
+            response = requests.get(JSON_URL)
+            data = response.json()
+
+            # Validate data
+            if not isinstance(data, dict) or not data:
+                print("No data found or data is invalid. Skipping this round.")
+                await asyncio.sleep(35)
+                continue
+
+            batch_size = 30
+            msg_ids = list(data.keys())
+
+            for i in range(0, len(msg_ids), batch_size):
+                batch = msg_ids[i:i + batch_size]
+                posts = await client.get_messages(CHANNEL_USERNAME, ids=[int(mid) for mid in batch])
+
+                for post in posts:
+                    if post:
+                        msg_id = str(post.id)
+                        current_views = post.views
+                        target_views = data.get(msg_id)
+
+                        if target_views is None:
+                            continue
+
+                        try:
+                            target_views = int(target_views)
+                        except:
+                            continue
+
+                        if current_views > target_views:
+                            try:
+                                await client.delete_messages(CHANNEL_USERNAME, post.id)
+                                requests.get(DELETE_API_URL + msg_id)
+                                post_link = f"https://t.me/{CHANNEL_USERNAME}/{msg_id}"
+                                await notify_admin(
+                                    f"🗑 Deleted post: {post_link}\nMessage ID: {msg_id}\nTarget views: {target_views}\nActual views: {current_views}"
+                                )
+                                print(f"Deleted message {msg_id}")
+                            except Exception as e:
+                                await notify_admin(f"❌ Error deleting message ID {msg_id}: {str(e)}")
+                                print(f"Error deleting message {msg_id}: {e}")
+
         except Exception as e:
-            await processing_msg.edit_text(f"❌ Download failed: {str(e)}")
-            return
+            await notify_admin(f"❌ Error during check: {str(e)}")
+            print("Error during check:", e)
 
-        # Upload file
-        await processing_msg.edit_text(f"📤 Starting upload: {filename}")
-        upload_success = await upload_large_file(update, temp_filename, f"📁 {title}")
-
-        if upload_success:
-            await processing_msg.edit_text("✅ Upload complete!")
+        # Sleep based on quantity
+        quantity = len(data)
+        if quantity < 400:
+            await asyncio.sleep(10)
         else:
-            await processing_msg.edit_text("❌ Upload failed. The file might be too large.")
+            await asyncio.sleep(20)
 
-    except Exception as e:
-        await processing_msg.edit_text(f"❌ Error: {str(e)}")
-        logging.error(f"Error in handle_message: {str(e)}")
-    finally:
-        if os.path.exists(temp_filename):
-            os.remove(temp_filename)
+async def main():
+    await client.start()
+    print("✅ Userbot started!")
+    asyncio.create_task(check_posts())
+    await client.run_until_disconnected()
 
-def main() -> None:
-    start_health_check_server()
-    
-    application = Application.builder() \
-        .token(TOKEN) \
-        .api_id(API_ID) \
-        .api_hash(API_HASH) \
-        .build()
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    logging.info("🤖 Bot is running...")
-    application.run_polling()
-
-if __name__ == '__main__':
-    main()
+asyncio.run(main())
