@@ -128,6 +128,7 @@ async def process_download(event, url):
     message = await event.reply('🔍 Processing your link...')
     temp_filename = None
     last_message_time = time.time()
+    last_progress = 0  # Track last reported progress percentage
 
     try:
         # Get file info
@@ -154,18 +155,22 @@ async def process_download(event, url):
         filename = f"video_{int(time.time())}{ext}"
         temp_filename = f"temp_{filename}"
 
-        # Progress callback with rate limiting
+        # Progress callback with rate limiting and progress threshold
         async def progress_callback(filename, downloaded, total, speed):
-            nonlocal last_message_time
+            nonlocal last_message_time, last_progress
             current_time = time.time()
-            # Only update message every 3 seconds to avoid spam
-            if current_time - last_message_time >= 3:
+            current_progress = (downloaded / total) * 100
+            
+            # Only update if significant progress (5%) or 5 seconds passed
+            if (current_time - last_message_time >= 5 or 
+                abs(current_progress - last_progress) >= 5):
                 await message.edit(
                     f"⬇️ Downloading: {filename}\n"
                     f"Progress: {downloaded//(1024*1024)}MB / {total//(1024*1024)}MB\n"
                     f"Speed: {speed:.1f} MB/s"
                 )
                 last_message_time = current_time
+                last_progress = current_progress
 
         # Download file
         await log_download(user_id, url, filename, file_size, 'downloading')
@@ -174,15 +179,18 @@ async def process_download(event, url):
         file_size = await download_file(hd_url, temp_filename, progress_callback)
         await log_download(user_id, url, filename, file_size, 'downloaded')
 
-        # Upload file
+        # Upload file with optimized settings
         await message.edit(f"📤 Starting upload: {filename}")
         
-        # Upload progress callback with rate limiting
+        # Upload progress callback with similar rate limiting
         def upload_progress_callback(current, total):
-            nonlocal last_message_time
+            nonlocal last_message_time, last_progress
             current_time = time.time()
-            # Only update message every 3 seconds to avoid spam
-            if current_time - last_message_time >= 3:
+            current_progress = (current / total) * 100
+            
+            # Only update if significant progress (5%) or 5 seconds passed
+            if (current_time - last_message_time >= 5 or 
+                abs(current_progress - last_progress) >= 5):
                 asyncio.create_task(
                     message.edit(
                         f"📤 Uploading: {filename}\n"
@@ -190,8 +198,10 @@ async def process_download(event, url):
                     )
                 )
                 last_message_time = current_time
+                last_progress = current_progress
 
-        # Send file with progress and proper video attributes
+        # Optimized upload settings
+        upload_start = time.time()
         await event.client.send_file(
             event.chat_id,
             temp_filename,
@@ -200,19 +210,20 @@ async def process_download(event, url):
             attributes=[
                 types.DocumentAttributeFilename(filename),
                 types.DocumentAttributeVideo(
-                    duration=0,  # Will be auto-detected
-                    w=0,         # Will be auto-detected
-                    h=0,         # Will be auto-detected
-                    supports_streaming=True,
-                    round_message=False,
-                    nosound=False
+                    duration=0,  # Auto-detect
+                    w=0,        # Auto-detect
+                    h=0,        # Auto-detect
+                    supports_streaming=True
                 )
             ],
-            part_size=1024*1024,  # 1MB chunks for upload
-            force_document=False   # Send as video, not file
+            part_size=1024*1024*2,  # 2MB chunks for faster upload
+            workers=4,              # Parallel upload workers
+            force_document=False    # Send as media, not document
         )
+        upload_time = time.time() - upload_start
+        upload_speed = file_size / (1024 * 1024) / upload_time if upload_time > 0 else 0
         
-        await message.edit("✅ Upload complete!")
+        await message.edit(f"✅ Upload complete! ({upload_speed:.1f} MB/s)")
         await log_download(user_id, url, filename, file_size, 'uploaded')
 
     except Exception as e:
@@ -235,7 +246,9 @@ async def main():
             API_ID,
             API_HASH,
             base_logger=logger,
-            connection_retries=5
+            connection_retries=5,
+            request_retries=5,
+            flood_sleep_threshold=60  # Increase flood wait threshold
         )
         
         await client.start(bot_token=BOT_TOKEN)
@@ -267,6 +280,8 @@ async def main():
             try:
                 active_downloads.add(event.text)
                 await process_download(event, event.text)
+            except Exception as e:
+                logger.error(f"Error processing message: {str(e)}")
             finally:
                 active_downloads.discard(event.text)
         
@@ -286,4 +301,4 @@ if __name__ == '__main__':
         asyncio.run(main())
     except Exception as e:
         logger.error(f"Fatal error: {str(e)}")
-        time.sleep(5)  # Wait before exiting to see logs
+        time.sleep(2)  # Wait before exiting to see logs
