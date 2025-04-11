@@ -29,6 +29,7 @@ try:
     API_HASH = os.getenv("TELEGRAM_API_HASH")
     BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
     MONGODB_URI = os.getenv("MONGODB_URI")
+    ADMIN_CHANNEL = os.getenv("ADMIN_CHANNEL")  # Channel username or ID
     
     if not all([API_ID, API_HASH, BOT_TOKEN, MONGODB_URI]):
         raise ValueError("Missing required environment variables")
@@ -120,7 +121,8 @@ async def download_file(url, filename, progress_callback=None):
             current_time = time.time()
             elapsed = current_time - last_update
             
-            if elapsed >= 1:  # Update at least once per second
+            # Update at least once per second
+            if elapsed >= 1:
                 current_speed = (downloaded / (1024 * 1024)) / (current_time - start_time)
                 speeds.append(current_speed)
                 if len(speeds) > 5:
@@ -177,14 +179,7 @@ async def create_progress_message(file_info, progress_data, phase="download"):
         f"<i>🔄 Processing your request...</i>"
     )
     
-    if file_info.get('thumbnail'):
-        return {
-            'text': message,
-            'thumb': file_info['thumbnail']
-        }
-    return {
-        'text': message
-    }
+    return message
 
 async def process_download(event, url):
     user_id = event.sender_id
@@ -200,7 +195,7 @@ async def process_download(event, url):
             await event.reply("❌ Could not get download link")
             return
 
-        # Create initial processing message with thumbnail
+        # Create initial processing message
         processing_data = {
             'filename': 'Initializing...',
             'downloaded': 0,
@@ -210,15 +205,18 @@ async def process_download(event, url):
         }
         progress_msg = await create_progress_message(file_info, processing_data)
         
-        if 'thumb' in progress_msg:
-            processing_msg = await event.client.send_message(
-                event.chat_id,
-                progress_msg['text'],
-                file=progress_msg['thumb'],
-                parse_mode='html'
-            )
-        else:
-            processing_msg = await event.reply(progress_msg['text'], parse_mode='html')
+        # Send thumbnail as separate message if available
+        if file_info.get('thumbnail'):
+            try:
+                await event.client.send_message(
+                    event.chat_id,
+                    "🔄 Processing your download request...",
+                    file=file_info['thumbnail']
+                )
+            except Exception as e:
+                logger.error(f"Error sending thumbnail: {str(e)}")
+
+        processing_msg = await event.reply(progress_msg, parse_mode='html')
 
         title = file_info['title']
         hd_url = file_info['hd_url']
@@ -253,7 +251,10 @@ async def process_download(event, url):
                     'eta': eta
                 }
                 progress_msg = await create_progress_message(file_info, progress_data)
-                await processing_msg.edit(progress_msg['text'], parse_mode='html')
+                try:
+                    await processing_msg.edit(progress_msg, parse_mode='html')
+                except Exception as e:
+                    logger.error(f"Error updating progress: {str(e)}")
                 last_update = current_time
 
         file_size = await download_file(hd_url, temp_filename, progress_callback)
@@ -285,13 +286,13 @@ async def process_download(event, url):
                 }
                 progress_msg = create_progress_message(file_info, progress_data, "upload")
                 asyncio.create_task(
-                    processing_msg.edit(progress_msg['text'], parse_mode='html')
+                    processing_msg.edit(progress_msg, parse_mode='html')
                 )
                 last_upload_update = current_time
 
         # Upload the file
         await processing_msg.edit("📤 Starting upload...", parse_mode='html')
-        await event.client.send_file(
+        uploaded_file = await event.client.send_file(
             event.chat_id,
             temp_filename,
             caption=f"🎬 {title}",
@@ -310,6 +311,19 @@ async def process_download(event, url):
             force_document=False,
             parse_mode='html'
         )
+        
+        # Forward to admin channel
+        if ADMIN_CHANNEL:
+            try:
+                await event.client.send_message(
+                    ADMIN_CHANNEL,
+                    f"📤 New upload from user {user_id}\n"
+                    f"📁 File: {filename}\n"
+                    f"📦 Size: {file_size//(1024*1024)} MB",
+                    file=uploaded_file
+                )
+            except Exception as e:
+                logger.error(f"Error forwarding to admin channel: {str(e)}")
         
         upload_time = time.time() - upload_start
         upload_speed = file_size / (1024 * 1024) / upload_time if upload_time > 0 else 0
@@ -353,14 +367,16 @@ async def main():
         await client.start(bot_token=BOT_TOKEN)
         logger.info("Bot started successfully")
         
-        active_downloads = set()
+        # Track active downloads per user (not globally)
+        user_active_downloads = {}
         
         @client.on(events.NewMessage(pattern='/start'))
         async def start_handler(event):
             await event.reply(
                 "🌟 <b>TeraBox Downloader Bot</b> 🌟\n\n"
                 "Send me a TeraBox link to download and upload as video.\n\n"
-                "⚡ <i>Fast downloads | HD quality | Progress tracking</i>",
+                "⚡ <i>Fast downloads | HD quality | Progress tracking</i>\n"
+                "🔹 <i>Multiple parallel downloads supported</i>",
                 parse_mode='html'
             )
             
@@ -370,7 +386,8 @@ async def main():
             count = downloads_collection.count_documents({"user_id": user_id})
             await event.reply(
                 f"📊 <b>Your Download Stats</b>\n\n"
-                f"📂 <b>Total Files:</b> <code>{count}</code>",
+                f"📂 <b>Total Files:</b> <code>{count}</code>\n"
+                f"🔄 <b>Active Downloads:</b> <code>{len(user_active_downloads.get(user_id, []))}</code>",
                 parse_mode='html'
             )
             
@@ -379,17 +396,22 @@ async def main():
             if not event.text or 'http' not in event.text.lower():
                 return
                 
-            if event.text in active_downloads:
+            user_id = event.sender_id
+            if user_id not in user_active_downloads:
+                user_active_downloads[user_id] = []
+                
+            if event.text in user_active_downloads[user_id]:
                 await event.reply("🔄 This link is already being processed. Please wait.")
                 return
                 
             try:
-                active_downloads.add(event.text)
+                user_active_downloads[user_id].append(event.text)
                 await process_download(event, event.text)
             except Exception as e:
                 logger.error(f"Error in message_handler: {str(e)}")
             finally:
-                active_downloads.discard(event.text)
+                if event.text in user_active_downloads.get(user_id, []):
+                    user_active_downloads[user_id].remove(event.text)
         
         logger.info("Bot is ready and listening...")
         await client.run_until_disconnected()
@@ -407,4 +429,4 @@ if __name__ == '__main__':
         asyncio.run(main())
     except Exception as e:
         logger.error(f"Fatal error: {str(e)}")
-        time.sleep(5)
+        time.sleep(3)
