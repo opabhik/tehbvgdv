@@ -1,5 +1,7 @@
 import os
 import requests
+import time
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -9,11 +11,11 @@ from telegram.ext import (
     filters,
     CallbackQueryHandler
 )
-import time
 from urllib.parse import urlparse
 from pymongo import MongoClient
 from dotenv import load_dotenv
 
+# Load environment variables
 load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -64,7 +66,21 @@ async def download_file_with_telegram_progress(url, filename, msg):
 
     return total_size
 
-# ... [keep all your other existing functions unchanged until handle_message]
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text('Welcome! Please send me a TeraBox link to process.')
+
+async def retry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    original_message = query.message.reply_to_message
+    if original_message:
+        context.user_data['retry_count'] = context.user_data.get('retry_count', 0) + 1
+        if context.user_data['retry_count'] > 3:
+            await query.edit_message_text("❌ Maximum retry attempts reached. Please try again later.")
+            return
+        
+        await query.edit_message_text(f"🔄 Retrying attempt {context.user_data['retry_count']}...")
+        await handle_message(Update(message=original_message), context)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message_text = update.message.text
@@ -107,6 +123,57 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                             parse_mode="Markdown"
                         )
 
-                        # ... [rest of your existing handle_message code]
+                        # Simulate upload progress
+                        for i in range(0, 101, 10):
+                            bar = f"{'█' * (i // 10)}{' ' * (10 - (i // 10))}"
+                            await processing_msg.edit_text(
+                                f"📤 Uploading: {filename}\n{i}% |{bar}| {int((i/100)*file_size_mb)}MB / {int(file_size_mb)}MB [~1.1 MB/s]",
+                                parse_mode="Markdown"
+                            )
+                            await asyncio.sleep(0.5)
 
-# ... [keep the rest of your code unchanged]
+                        # Upload the video to Telegram
+                        with open(filename, 'rb') as video_file:
+                            await update.message.reply_video(
+                                video=video_file,
+                                caption=f"🎥 {title}",
+                                supports_streaming=True
+                            )
+
+                        await processing_msg.edit_text("✅ Upload complete!")
+
+                    except Exception as e:
+                        await processing_msg.edit_text(f"❌ Error during upload: {str(e)}")
+                        print(f"\nUpload error: {str(e)}")
+                    finally:
+                        if os.path.exists(filename):
+                            os.remove(filename)
+
+            else:
+                await processing_msg.edit_text("❌ No valid data found in the API response.")
+
+        except requests.exceptions.Timeout:
+            keyboard = [
+                [InlineKeyboardButton("🔄 Retry", callback_data="retry")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await processing_msg.edit_text(
+                "⌛ The request timed out.",
+                reply_markup=reply_markup
+            )
+        except Exception as e:
+            await processing_msg.edit_text(f"❌ Error: {str(e)}")
+    else:
+        await update.message.reply_text("⚠️ Please send a valid URL starting with http or https.")
+
+def main() -> None:
+    application = Application.builder().token(TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CallbackQueryHandler(retry_callback, pattern="^retry$"))
+
+    print("🤖 Bot is running... Press Ctrl+C to stop")
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
