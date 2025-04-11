@@ -1,109 +1,99 @@
-from telethon import TelegramClient, events
+import os
 import asyncio
-import re
 import requests
-import json
+import time
+from urllib.parse import urlparse
+from pymongo import MongoClient
+from dotenv import load_dotenv
+from telethon import TelegramClient, events
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
+import logging
 
-# Healthcheck server
+# Configure logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Load environment variables
+load_dotenv()
+
+# Configuration
+try:
+    API_ID = int(os.getenv("TELEGRAM_API_ID"))
+    API_HASH = os.getenv("TELEGRAM_API_HASH")
+    BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
+    MONGODB_URI = os.getenv("MONGODB_URI")
+    
+    if not all([API_ID, API_HASH, BOT_TOKEN, MONGODB_URI]):
+        raise ValueError("Missing required environment variables")
+except Exception as e:
+    logger.error(f"Configuration error: {str(e)}")
+    raise
+
+# Health check server
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
 
-def start_dummy_server():
+def start_health_server():
     server = HTTPServer(("0.0.0.0", 8000), HealthCheckHandler)
+    logger.info("Health check server running on port 8000")
     server.serve_forever()
 
-threading.Thread(target=start_dummy_server, daemon=True).start()
+# Start health check server in background
+health_thread = threading.Thread(target=start_health_server, daemon=True)
+health_thread.start()
 
-# Telegram credentials
-api_id = 28241713
-api_hash = '7ef0b559f6048c1396aa3d285665fbca'
-client = TelegramClient('session', api_id, api_hash)
-
-# Settings
-CHANNEL_USERNAME = 'twsthsush'  # Channel username without @
-JSON_URL = 'https://opabhik.serv00.net/track/data.json'  # JSON file URL
-DELETE_API_URL = 'https://opabhik.serv00.net/track/delete.php?msg_id='  # Delete URL
-ADMIN_ID = 1562465522  # Your Telegram user ID
-
-@client.on(events.NewMessage)
-async def handle_message(event):
-    message = event.message.message.lower()
-    if message == "hi":
-        await event.reply("✅")
-
-async def notify_admin(text):
+async def connect_mongodb():
     try:
-        await client.send_message(ADMIN_ID, text)
+        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+        # Verify connection
+        client.server_info()
+        db = client.get_database("telegram_bot")
+        return db
     except Exception as e:
-        print(f"Error sending message to admin: {e}")
-
-async def check_posts():
-    while True:
-        try:
-            print("Checking posts...")
-            response = requests.get(JSON_URL)
-            data = response.json()
-
-            # Validate data
-            if not isinstance(data, dict) or not data:
-                print("No data found or data is invalid. Skipping this round.")
-                await asyncio.sleep(35)
-                continue
-
-            batch_size = 30
-            msg_ids = list(data.keys())
-
-            for i in range(0, len(msg_ids), batch_size):
-                batch = msg_ids[i:i + batch_size]
-                posts = await client.get_messages(CHANNEL_USERNAME, ids=[int(mid) for mid in batch])
-
-                for post in posts:
-                    if post:
-                        msg_id = str(post.id)
-                        current_views = post.views
-                        target_views = data.get(msg_id)
-
-                        if target_views is None:
-                            continue
-
-                        try:
-                            target_views = int(target_views)
-                        except:
-                            continue
-
-                        if current_views > target_views:
-                            try:
-                                await client.delete_messages(CHANNEL_USERNAME, post.id)
-                                requests.get(DELETE_API_URL + msg_id)
-                                post_link = f"https://t.me/{CHANNEL_USERNAME}/{msg_id}"
-                                await notify_admin(
-                                    f"🗑 Deleted post: {post_link}\nMessage ID: {msg_id}\nTarget views: {target_views}\nActual views: {current_views}"
-                                )
-                                print(f"Deleted message {msg_id}")
-                            except Exception as e:
-                                await notify_admin(f"❌ Error deleting message ID {msg_id}: {str(e)}")
-                                print(f"Error deleting message {msg_id}: {e}")
-
-        except Exception as e:
-            await notify_admin(f"❌ Error during check: {str(e)}")
-            print("Error during check:", e)
-
-        # Sleep based on quantity
-        quantity = len(data)
-        if quantity < 400:
-            await asyncio.sleep(10)
-        else:
-            await asyncio.sleep(20)
+        logger.error(f"MongoDB connection error: {str(e)}")
+        raise
 
 async def main():
-    await client.start()
-    print("✅ Userbot started!")
-    asyncio.create_task(check_posts())
-    await client.run_until_disconnected()
+    try:
+        logger.info("Starting Telegram bot...")
+        
+        # Connect to MongoDB
+        db = await connect_mongodb()
+        downloads_collection = db.downloads
+        
+        # Initialize Telegram client
+        client = TelegramClient('bot_session', API_ID, API_HASH)
+        await client.start(bot_token=BOT_TOKEN)
+        logger.info("Bot started successfully")
+        
+        @client.on(events.NewMessage(pattern='/start'))
+        async def start_handler(event):
+            await event.reply('Bot is working! Send me a TeraBox link.')
+            
+        @client.on(events.NewMessage())
+        async def message_handler(event):
+            if 'http' in event.text.lower():
+                await event.reply("Link received! (This is a test response)")
+            else:
+                await event.reply("Please send a valid URL")
+        
+        logger.info("Bot is ready and listening...")
+        await client.run_until_disconnected()
+        
+    except Exception as e:
+        logger.error(f"Bot failed to start: {str(e)}")
+        raise
 
-asyncio.run(main())
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        logger.error(f"Fatal error: {str(e)}")
+        time.sleep(5)  # Wait before exiting to see logs
