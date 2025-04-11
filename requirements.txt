@@ -1,0 +1,4 @@
+python-telegram-bot
+pymongo
+requests
+python-dotenv
