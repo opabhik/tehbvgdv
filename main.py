@@ -9,7 +9,7 @@ from telethon import TelegramClient, events, types
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 import logging
-import json
+import mimetypes
 
 # Configure logging
 logging.basicConfig(
@@ -72,11 +72,21 @@ async def log_download(user_id, url, filename, size, status):
     })
 
 async def download_file(url, filename, progress_callback=None):
-    response = requests.get(url, stream=True)
+    # Increase timeout and use session for better performance
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=50,
+        pool_maxsize=50,
+        max_retries=3
+    )
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+
+    response = session.get(url, stream=True, timeout=30)
     response.raise_for_status()
 
     total_size = int(response.headers.get('content-length', 0))
-    block_size = 1024 * 1024  # 1MB chunks
+    block_size = 1024 * 1024 * 4  # 4MB chunks for faster download
     downloaded = 0
     last_update = time.time()
 
@@ -85,9 +95,8 @@ async def download_file(url, filename, progress_callback=None):
             f.write(data)
             downloaded += len(data)
             
-            # Update progress every 5 seconds
-            if time.time() - last_update > 5 and progress_callback:
-                percent = (downloaded / total_size) * 100
+            # Update progress every 3 seconds (less frequent updates)
+            if time.time() - last_update > 3 and progress_callback:
                 speed = downloaded / (1024 * 1024) / (time.time() - last_update)
                 await progress_callback(filename, downloaded, total_size, speed)
                 last_update = time.time()
@@ -118,6 +127,7 @@ async def process_download(event, url):
     user_id = event.sender_id
     message = await event.reply('🔍 Processing your link...')
     temp_filename = None
+    last_message_time = time.time()
 
     try:
         # Get file info
@@ -138,16 +148,24 @@ async def process_download(event, url):
             await message.edit(f"⚠️ File too large ({file_size//(1024*1024)}MB > {MAX_FILE_SIZE//(1024*1024)}MB)")
             return
 
-        filename = os.path.basename(urlparse(hd_url).path) or f"file_{int(time.time())}.mp4"
+        # Determine file extension from content type or URL
+        content_type = head_response.headers.get('content-type', '')
+        ext = mimetypes.guess_extension(content_type) or '.mp4'
+        filename = f"video_{int(time.time())}{ext}"
         temp_filename = f"temp_{filename}"
 
-        # Progress callback
+        # Progress callback with rate limiting
         async def progress_callback(filename, downloaded, total, speed):
-            await message.edit(
-                f"⬇️ Downloading: {filename}\n"
-                f"Progress: {downloaded//(1024*1024)}MB / {total//(1024*1024)}MB\n"
-                f"Speed: {speed:.1f} MB/s"
-            )
+            nonlocal last_message_time
+            current_time = time.time()
+            # Only update message every 3 seconds to avoid spam
+            if current_time - last_message_time >= 3:
+                await message.edit(
+                    f"⬇️ Downloading: {filename}\n"
+                    f"Progress: {downloaded//(1024*1024)}MB / {total//(1024*1024)}MB\n"
+                    f"Speed: {speed:.1f} MB/s"
+                )
+                last_message_time = current_time
 
         # Download file
         await log_download(user_id, url, filename, file_size, 'downloading')
@@ -159,30 +177,40 @@ async def process_download(event, url):
         # Upload file
         await message.edit(f"📤 Starting upload: {filename}")
         
-        # Upload progress callback
+        # Upload progress callback with rate limiting
         def upload_progress_callback(current, total):
-            asyncio.create_task(
-                message.edit(
-                    f"📤 Uploading: {filename}\n"
-                    f"Progress: {current//(1024*1024)}MB / {total//(1024*1024)}MB"
+            nonlocal last_message_time
+            current_time = time.time()
+            # Only update message every 3 seconds to avoid spam
+            if current_time - last_message_time >= 3:
+                asyncio.create_task(
+                    message.edit(
+                        f"📤 Uploading: {filename}\n"
+                        f"Progress: {current//(1024*1024)}MB / {total//(1024*1024)}MB"
+                    )
                 )
-            )
+                last_message_time = current_time
 
-        # Send file with progress
+        # Send file with progress and proper video attributes
         await event.client.send_file(
             event.chat_id,
             temp_filename,
-            caption=f"📁 {title}",
+            caption=f"🎬 {title}",
             progress_callback=upload_progress_callback,
             attributes=[
                 types.DocumentAttributeFilename(filename),
                 types.DocumentAttributeVideo(
-                    duration=0,
-                    w=0,
-                    h=0,
-                    supports_streaming=True
+                    duration=0,  # Will be auto-detected
+                    w=0,         # Will be auto-detected
+                    h=0,         # Will be auto-detected
+                    supports_streaming=True,
+                    round_message=False,
+                    nosound=False
                 )
-            ]
+            ],
+            # Optimize upload settings
+            part_size=1024*1024,  # 1MB chunks for upload
+            force_document=False   # Send as video, not file
         )
         
         await message.edit("✅ Upload complete!")
@@ -202,14 +230,28 @@ async def main():
     try:
         logger.info("Starting Telegram bot...")
         
-        # Initialize Telegram client
-        client = TelegramClient('bot_session', API_ID, API_HASH)
-        await client.start(bot_token=BOT_TOKEN)
+        # Initialize Telegram client with optimized settings
+        client = TelegramClient(
+            'bot_session',
+            API_ID,
+            API_HASH,
+            base_logger=logger,
+            connection_retries=5,
+            auto_reconnect=True
+        )
+        
+        await client.start(
+            bot_token=BOT_TOKEN,
+            max_retries=5
+        )
         logger.info("Bot started successfully")
+        
+        # Track active downloads to prevent duplicate processing
+        active_downloads = set()
         
         @client.on(events.NewMessage(pattern='/start'))
         async def start_handler(event):
-            await event.reply('Welcome! Send me a TeraBox link to download and upload.')
+            await event.reply('Welcome! Send me a TeraBox link to download and upload as video.')
             
         @client.on(events.NewMessage(pattern='/stats'))
         async def stats_handler(event):
@@ -219,10 +261,19 @@ async def main():
             
         @client.on(events.NewMessage())
         async def message_handler(event):
-            if 'http' in event.text.lower():
+            if not event.text or 'http' not in event.text.lower():
+                return
+                
+            # Check if this URL is already being processed
+            if event.text in active_downloads:
+                await event.reply("This link is already being processed. Please wait.")
+                return
+                
+            try:
+                active_downloads.add(event.text)
                 await process_download(event, event.text)
-            else:
-                await event.reply("Please send a valid TeraBox URL starting with http")
+            finally:
+                active_downloads.discard(event.text)
         
         logger.info("Bot is ready and listening...")
         await client.run_until_disconnected()
