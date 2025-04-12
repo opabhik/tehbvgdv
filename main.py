@@ -10,11 +10,11 @@ import logging
 import mimetypes
 from datetime import timedelta
 
-# Temporary fix for Python 3.13 compatibility
+# Fix imghdr removal in Python 3.13+
 try:
     import imghdr
 except ImportError:
-    import filetype as imghdr  # Fallback to filetype library
+    import filetype as imghdr
 
 # Configure logging
 logging.basicConfig(
@@ -31,6 +31,13 @@ API_ID = int(os.getenv("TELEGRAM_API_ID"))
 API_HASH = os.getenv("TELEGRAM_API_HASH")
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 MONGODB_URI = os.getenv("MONGODB_URI")
+
+# MongoDB
+mongo_client = MongoClient(MONGODB_URI)
+db = mongo_client.get_database("telegram_bot")
+downloads_collection = db.downloads
+
+# ... rest of your code is unchanged ...
 
 # MongoDB
 mongo_client = MongoClient(MONGODB_URI)
