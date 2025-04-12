@@ -25,9 +25,7 @@ ADMIN_ID = 1562465522
 IST_OFFSET = timedelta(hours=5, minutes=30)  # IST is UTC+5:30
 GROUP_LINK = "https://t.me/+hK0K5vZhV3owMmM1"
 LOADING_STICKERS = [
-    "CAACAgUAAxkBAAIFamc51_0aGtMerxmg7w3yLKo-S5YpAAI6EwACtjPQVXt8WJEmWqbsNgQ",
-    "CAACAgUAAxkBAAIFbGc52B3b1wABHZq2yVgQxJXe3zWJqAACPhMAAjYz0FV7fFiRJlrG7DYE",
-    "CAACAgUAAxkBAAIFbmc52DAAAXwvV4Yw7w3yLKo-S5YpAAI_EwACNjPQVXt8WJEmWqbsNgQ"
+    "CAACAgUAAxkBAAICrmcLfBNpxMV_A4j59womoatTkTlHAAIEAAPBJDExieUdbguzyBA2BA"
 ]
 WELCOME_IMAGES = [
     "https://envs.sh/5OQ.jpg",
@@ -168,14 +166,14 @@ async def add_to_queue(user_id, url):
     })
 
 async def cancel_user_downloads(user_id):
-    downloads_collection.update_many(
+    result = downloads_collection.update_many(
         {
             'user_id': user_id,
             'status': {'$in': ['downloading', 'processing']}
         },
         {'$set': {'status': 'cancelled'}}
     )
-    return downloads_collection.count_documents({'user_id': user_id, 'status': 'cancelled'})
+    return result.modified_count
 
 def get_user_stats(user_id):
     total_downloads = downloads_collection.count_documents({'user_id': user_id})
@@ -252,33 +250,10 @@ async def download_file(url, filename, progress_callback=None, cancel_flag=None)
                                 await progress_callback(downloaded, total_size, speed, eta)
 
                             last_update = now
-        return total_size
+            return total_size
     except Exception as e:
         logger.error(f"Download error: {e}")
         raise
-
-async def show_progress(msg: Message, filename, downloaded, total, speed, eta, cancel_button=None):
-    percent = (downloaded / total) * 100 if total else 0
-    bar = "⬢" * int(percent / 5) + "⬡" * (20 - int(percent / 5))
-    text = (
-        f"⬇️ `{filename}`\n"
-        f"{bar} {percent:.1f}%\n"
-        f"⚡ {speed:.1f} MB/s • ⏳ {eta:.0f}s\n"
-        f"📦 {downloaded/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB"
-    )
-    
-    try:
-        if cancel_button:
-            await msg.edit_text(
-                text,
-                reply_markup=InlineKeyboardMarkup([
-                    [cancel_button]
-                ])
-            )
-        else:
-            await msg.edit_text(text)
-    except Exception as e:
-        logger.error(f"Error updating progress: {e}")
 
 # Pyrogram client
 app = Client(
@@ -432,7 +407,7 @@ async def cancel_download_callback(client, callback_query: CallbackQuery):
     try:
         download_id = callback_query.data.split("_")[2]
         downloads_collection.update_one(
-            {'_id': download_id},
+            {'download_id': download_id},
             {'$set': {'status': 'cancelled'}}
         )
         await callback_query.answer("Download cancellation requested")
@@ -443,8 +418,17 @@ async def cancel_download_callback(client, callback_query: CallbackQuery):
 
 async def handle_download(user, url, is_from_queue=False):
     message = user.message if hasattr(user, 'message') else None
+    loading_sticker_msg = None
+    progress_msg = None
+    download_id = secrets.token_hex(4)
     
     try:
+        # Send loading sticker
+        loading_sticker = random.choice(LOADING_STICKERS)
+        if message:
+            loading_sticker_msg = await message.reply_sticker(loading_sticker)
+
+        # Fetch video info
         api = f"https://true12g.in/api/terabox.php?url={url}"
         data = requests.get(api).json()
 
@@ -461,43 +445,60 @@ async def handle_download(user, url, is_from_queue=False):
         filename = f"{title[:50]}{ext}"
         temp_path = f"temp_{filename}"
 
+        # Delete loading sticker and send thumbnail with progress
+        if message and loading_sticker_msg:
+            try:
+                await loading_sticker_msg.delete()
+            except Exception:
+                pass
+
+            # Send thumbnail with initial progress
+            cancel_button = InlineKeyboardButton(
+                "❌ Cancel Download", 
+                callback_data=f"cancel_download_{download_id}"
+            )
+            progress_msg = await message.reply_photo(
+                thumbnail,
+                caption="🔄 Starting download... 0%",
+                reply_markup=InlineKeyboardMarkup([[cancel_button]])
+            )
+
         # Add to active downloads
-        download_id = downloads_collection.insert_one({
+        downloads_collection.insert_one({
             'user_id': user.id,
             'filename': filename,
             'url': url,
             'status': 'downloading',
-            'started_at': get_ist_time()
-        }).inserted_id
-
-        # Thumbnail and loading sticker
-        loading_sticker = random.choice(LOADING_STICKERS)
-        if message:
-            progress_msg = await message.reply(
-                "🔄 Starting download...",
-                reply_to_message_id=message.id,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel_download_{download_id}")]
-                ])
-            )
-            await message.reply_sticker(loading_sticker)
+            'started_at': get_ist_time(),
+            'download_id': download_id
+        })
 
         # Download with cancel support
         cancel_flag = asyncio.Event()
         
         async def progress_callback(dl, total, spd, eta):
             if message and progress_msg:
-                cancel_button = InlineKeyboardButton(
-                    "❌ Cancel Download", 
-                    callback_data=f"cancel_download_{download_id}"
+                percent = (dl / total) * 100 if total else 0
+                bar = "⬢" * int(percent / 5) + "⬡" * (20 - int(percent / 5))
+                text = (
+                    f"⬇️ `{filename}`\n"
+                    f"{bar} {percent:.1f}%\n"
+                    f"⚡ {spd:.1f} MB/s • ⏳ {eta:.0f}s\n"
+                    f"📦 {dl/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB"
                 )
-                await show_progress(progress_msg, filename, dl, total, spd, eta, cancel_button)
+                try:
+                    await progress_msg.edit_caption(
+                        caption=text,
+                        reply_markup=InlineKeyboardMarkup([[cancel_button]])
+                    )
+                except Exception as e:
+                    logger.error(f"Progress update error: {e}")
 
         try:
             size = await download_file(dl_url, temp_path, progress_callback, cancel_flag)
             
-            if message:
-                await progress_msg.edit("📤 Uploading to Telegram...")
+            if message and progress_msg:
+                await progress_msg.edit_caption("📤 Uploading to Telegram...")
                 await message.reply_chat_action(enums.ChatAction.UPLOAD_VIDEO)
 
             await app.send_video(
@@ -524,7 +525,7 @@ async def handle_download(user, url, is_from_queue=False):
             if os.path.exists(temp_path):
                 os.remove(temp_path)
             downloads_collection.update_one(
-                {'_id': download_id},
+                {'download_id': download_id},
                 {'$set': {'status': 'completed'}}
             )
 
@@ -532,6 +533,11 @@ async def handle_download(user, url, is_from_queue=False):
         logger.error(f"Error: {e}")
         if message:
             await message.reply(f"❌ Error: {e}")
+        if loading_sticker_msg:
+            try:
+                await loading_sticker_msg.delete()
+            except Exception:
+                pass
 
 @app.on_message(filters.text & ~filters.command(["start", "status", "restart"]))
 async def handle_link(client, message):
