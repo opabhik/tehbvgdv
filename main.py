@@ -7,13 +7,39 @@ import logging
 import requests
 import threading
 import secrets
+import random
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from pymongo import MongoClient
-from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram import Client, filters, enums
+from pyrogram.types import (
+    Message, 
+    InlineKeyboardMarkup, 
+    InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove
+)
+from pyrogram.errors import FloodWait
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytz
+
+# Admin ID
+ADMIN_ID = 1562465522
+
+# Stickers for loading animation
+LOADING_STICKERS = [
+    "CAACAgUAAxkBAAIFamc51_0aGtMerxmg7w3yLKo-S5YpAAI6EwACtjPQVXt8WJEmWqbsNgQ",
+    "CAACAgUAAxkBAAIFbGc52B3b1wABHZq2yVgQxJXe3zWJqAACPhMAAjYz0FV7fFiRJlrG7DYE",
+    "CAACAgUAAxkBAAIFbmc52DAAAXwvV4Yw7w3yLKo-S5YpAAI_EwACNjPQVXt8WJEmWqbsNgQ"
+]
+
+# Welcome images
+WELCOME_IMAGES = [
+    "https://envs.sh/5OQ.jpg",
+    "https://envs.sh/5OK.jpg",
+    "https://envs.sh/zmX.jpg",
+    "https://envs.sh/zm6.jpg"
+]
 
 # Dummy HTTP healthcheck server
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -45,6 +71,8 @@ mongo_client = MongoClient(MONGODB_URI)
 db = mongo_client.get_database("telegram_bot")
 downloads_collection = db.downloads
 verifications_collection = db.verifications
+users_collection = db.users
+queue_collection = db.queue
 
 # Pyrogram client
 app = Client("koyeb_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -72,7 +100,8 @@ async def create_verification_link(user_id):
         'token': token,
         'created_at': datetime.now(pytz.timezone('Asia/Kolkata')),
         'expires_at': expires_at,
-        'verified': False
+        'verified': False,
+        'used': False
     })
     
     deep_link = f"https://telegram.me/iPopKorniaBot?start=verify-{token}"
@@ -106,8 +135,66 @@ def get_verification_status(user_id):
         'remaining': expires_at - datetime.now(india_tz)
     }
 
+async def notify_admin_new_user(user):
+    try:
+        user_info = (
+            f"👤 New User:\n\n"
+            f"• Name: {user.first_name} {user.last_name or ''}\n"
+            f"• Username: @{user.username}\n"
+            f"• ID: {user.id}\n"
+            f"• Joined at: {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%d-%m-%Y %I:%M %p')}"
+        )
+        await app.send_message(ADMIN_ID, user_info)
+    except Exception as e:
+        logger.error(f"Error notifying admin: {e}")
+
+async def check_user_in_queue(user_id):
+    active_downloads = downloads_collection.count_documents({
+        'user_id': user_id,
+        'status': {'$in': ['downloading', 'processing']}
+    })
+    return active_downloads >= 2
+
+async def add_to_queue(user_id, url):
+    queue_collection.insert_one({
+        'user_id': user_id,
+        'url': url,
+        'added_at': datetime.now(pytz.timezone('Asia/Kolkata')),
+        'status': 'pending'
+    })
+
+async def process_queue():
+    while True:
+        try:
+            queued_item = queue_collection.find_one_and_update(
+                {'status': 'pending'},
+                {'$set': {'status': 'processing'}},
+                sort=[('added_at', 1)]
+            )
+            
+            if queued_item:
+                user_id = queued_item['user_id']
+                url = queued_item['url']
+                
+                try:
+                    user = await app.get_users(user_id)
+                    await handle_download(user, url, is_from_queue=True)
+                except Exception as e:
+                    logger.error(f"Error processing queue item: {e}")
+                    await app.send_message(
+                        user_id,
+                        "❌ Error processing your queued download. Please try again."
+                    )
+                
+                queue_collection.delete_one({'_id': queued_item['_id']})
+            
+            await asyncio.sleep(5)
+        except Exception as e:
+            logger.error(f"Queue processing error: {e}")
+            await asyncio.sleep(10)
+
 # Download helper
-async def download_file(url, filename, progress_callback=None):
+async def download_file(url, filename, progress_callback=None, cancel_flag=None):
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
         total_size = int(r.headers.get('content-length', 0))
@@ -118,6 +205,9 @@ async def download_file(url, filename, progress_callback=None):
             last_update = time.time()
 
             for chunk in r.iter_content(1024 * 1024):  # 1MB chunks
+                if cancel_flag and cancel_flag.is_set():
+                    raise asyncio.CancelledError("Download cancelled by user")
+                
                 if chunk:
                     f.write(chunk)
                     downloaded += len(chunk)
@@ -135,7 +225,7 @@ async def download_file(url, filename, progress_callback=None):
     return total_size
 
 # Progress UI
-async def show_progress(msg: Message, filename, downloaded, total, speed, eta):
+async def show_progress(msg: Message, filename, downloaded, total, speed, eta, cancel_button=None):
     percent = (downloaded / total) * 100 if total else 0
     bar = "⬢" * int(percent / 5) + "⬡" * (20 - int(percent / 5))
     text = (
@@ -144,25 +234,47 @@ async def show_progress(msg: Message, filename, downloaded, total, speed, eta):
         f"⚡ {speed:.1f} MB/s • ⏳ {eta:.0f}s\n"
         f"📦 {downloaded/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB"
     )
+    
     try:
-        await msg.edit(text)
-    except Exception:
-        pass
+        if cancel_button:
+            await msg.edit_text(
+                text,
+                reply_markup=InlineKeyboardMarkup([
+                    [cancel_button]
+                ])
+            )
+        else:
+            await msg.edit_text(text)
+    except Exception as e:
+        logger.error(f"Error updating progress: {e}")
 
 # Commands
 @app.on_message(filters.command("start"))
 async def start_handler(client, message):
+    # Check if new user
+    user = message.from_user
+    if not users_collection.find_one({'user_id': user.id}):
+        users_collection.insert_one({
+            'user_id': user.id,
+            'username': user.username,
+            'first_name': user.first_name,
+            'last_name': user.last_name,
+            'joined_at': datetime.now(pytz.timezone('Asia/Kolkata'))
+        })
+        await notify_admin_new_user(user)
+    
     if len(message.command) > 1 and message.command[1].startswith('verify-'):
         token = message.command[1][7:]
         verification = verifications_collection.find_one({
             'token': token,
-            'expires_at': {'$gt': datetime.now(pytz.timezone('Asia/Kolkata'))}
+            'expires_at': {'$gt': datetime.now(pytz.timezone('Asia/Kolkata'))},
+            'used': False
         })
         
         if verification:
             verifications_collection.update_one(
                 {'_id': verification['_id']},
-                {'$set': {'verified': True}}
+                {'$set': {'verified': True, 'used': True}}
             )
             status = get_verification_status(verification['user_id'])
             await message.reply(
@@ -172,17 +284,34 @@ async def start_handler(client, message):
                 f"• Remaining time: {str(status['remaining']).split('.')[0]}"
             )
         else:
-            await message.reply("❌ Invalid or expired verification link.")
+            await message.reply("❌ Invalid, expired or already used verification link.")
     else:
+        welcome_image = random.choice(WELCOME_IMAGES)
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔍 Check Verification Status", callback_data="check_status")]
+            [InlineKeyboardButton("🔍 Check Status", callback_data="check_status")],
+            [
+                InlineKeyboardButton("👨‍💻 Developer", url="https://t.me/Opabhik"),
+                InlineKeyboardButton("💻 Source Code", url="https://t.me/True12G")
+            ]
         ])
-        await message.reply(
-            "🚀 Welcome to the Download Bot!\n\n"
-            "Send me a TeraBox link to download and upload.\n"
-            "You need to verify first if you haven't already.",
-            reply_markup=keyboard
-        )
+        
+        try:
+            await message.reply_photo(
+                welcome_image,
+                caption=(
+                    "🚀 Welcome to the Download Bot!\n\n"
+                    "Send me a TeraBox link to download and upload.\n"
+                    "You need to verify first if you haven't already."
+                ),
+                reply_markup=keyboard
+            )
+        except Exception:
+            await message.reply(
+                "🚀 Welcome to the Download Bot!\n\n"
+                "Send me a TeraBox link to download and upload.\n"
+                "You need to verify first if you haven't already.",
+                reply_markup=keyboard
+            )
 
 @app.on_message(filters.command("status"))
 async def status_handler(client, message):
@@ -210,11 +339,118 @@ async def check_status_callback(client, callback_query):
     else:
         await callback_query.edit_message_text("❌ You are not verified yet. Please verify first when you try to download.")
 
+@app.on_callback_query(filters.regex("^cancel_download_"))
+async def cancel_download_callback(client, callback_query):
+    download_id = callback_query.data.split("_")[2]
+    downloads_collection.update_one(
+        {'_id': download_id},
+        {'$set': {'status': 'cancelled'}}
+    )
+    await callback_query.answer("Download cancellation requested")
+    await callback_query.edit_message_text("❌ Download cancelled by user")
+
+async def handle_download(user, url, is_from_queue=False):
+    message = user.message if hasattr(user, 'message') else None
+    
+    try:
+        api = f"https://true12g.in/api/terabox.php?url={url}"
+        data = requests.get(api).json()
+
+        if not data.get('response'):
+            if message:
+                await message.reply("❌ Failed to fetch download info.")
+            return
+
+        file_info = data['response'][0]
+        dl_url = file_info['resolutions'].get('HD Video')
+        thumbnail = file_info.get('thumbnail', '')
+        title = file_info.get('title', f"video_{int(time.time())}")
+        ext = mimetypes.guess_extension(requests.head(dl_url).headers.get('content-type', '')) or '.mp4'
+        filename = f"{title[:50]}{ext}"
+        temp_path = f"temp_{filename}"
+
+        # Add to active downloads
+        download_id = downloads_collection.insert_one({
+            'user_id': user.id,
+            'filename': filename,
+            'url': url,
+            'status': 'downloading',
+            'started_at': datetime.now(pytz.timezone('Asia/Kolkata'))
+        }).inserted_id
+
+        # Thumbnail and loading sticker
+        loading_sticker = random.choice(LOADING_STICKERS)
+        if message:
+            progress_msg = await message.reply_photo(
+                thumbnail, 
+                caption="🔄 Starting download...",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel_download_{download_id}")]
+                ])
+            )
+            await message.reply_sticker(loading_sticker)
+
+        # Download with cancel support
+        cancel_flag = asyncio.Event()
+        
+        async def progress_callback(dl, total, spd, eta):
+            if message and progress_msg:
+                cancel_button = InlineKeyboardButton(
+                    "❌ Cancel Download", 
+                    callback_data=f"cancel_download_{download_id}"
+                )
+                await show_progress(progress_msg, filename, dl, total, spd, eta, cancel_button)
+
+        try:
+            size = await download_file(dl_url, temp_path, progress_callback, cancel_flag)
+            
+            if message:
+                await progress_msg.edit("📤 Uploading to Telegram...")
+                await message.reply_chat_action(enums.ChatAction.UPLOAD_VIDEO)
+
+            await app.send_video(
+                chat_id=user.id,
+                video=temp_path,
+                caption=f"✅ Upload complete!\nSize: {size / (1024 * 1024):.1f}MB\nTime: {timedelta(seconds=int(time.time() - message.date.timestamp()))}",
+                supports_streaming=True
+            )
+
+            if message and progress_msg:
+                await progress_msg.delete()
+
+        except asyncio.CancelledError:
+            if message:
+                await message.reply("❌ Download cancelled successfully.")
+            return
+        except Exception as e:
+            logger.error(f"Download error: {e}")
+            if message:
+                await message.reply(f"❌ Error during download: {e}")
+            return
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            downloads_collection.update_one(
+                {'_id': download_id},
+                {'$set': {'status': 'completed'}}
+            )
+
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        if message:
+            await message.reply(f"❌ Error: {e}")
+
 @app.on_message(filters.text & ~filters.command(["start", "status"]))
 async def handle_link(client, message):
     url = message.text.strip()
     if "terabox" not in url.lower():
         return
+    
+    # Set reaction to show processing
+    try:
+        await message.set_reaction("🔄")
+    except Exception:
+        pass
     
     # Check verification
     if not is_user_verified(message.from_user.id):
@@ -235,45 +471,20 @@ async def handle_link(client, message):
         )
         return
     
-    try:
-        api = f"https://true12g.in/api/terabox.php?url={url}"
-        data = requests.get(api).json()
-
-        if not data.get('response'):
-            return await message.reply("❌ Failed to fetch download info.")
-
-        file_info = data['response'][0]
-        dl_url = file_info['resolutions'].get('HD Video')
-        thumbnail = file_info.get('thumbnail', '')
-        title = file_info.get('title', f"video_{int(time.time())}")
-        ext = mimetypes.guess_extension(requests.head(dl_url).headers.get('content-type', '')) or '.mp4'
-        filename = f"{title[:50]}{ext}"
-        temp_path = f"temp_{filename}"
-
-        # Thumbnail
-        progress_msg = await message.reply_photo(thumbnail, caption="🔄 Starting download...")
-
-        # Download
-        async def progress_callback(dl, total, spd, eta):
-            await show_progress(progress_msg, filename, dl, total, spd, eta)
-
-        size = await download_file(dl_url, temp_path, progress_callback)
-
-        await progress_msg.edit("📤 Uploading to Telegram...")
-
-        await client.send_video(
-            chat_id=message.chat.id,
-            video=temp_path,
-            caption=f"✅ Upload complete!\nSize: {size / (1024 * 1024):.1f}MB\nTime: {timedelta(seconds=int(time.time() - message.date.timestamp()))}",
-            supports_streaming=True
+    # Check if user already has 2 active downloads
+    if await check_user_in_queue(message.from_user.id):
+        await add_to_queue(message.from_user.id, url)
+        await message.reply(
+            "⏳ You already have 2 active downloads. Your request has been added to queue.\n"
+            "I'll process it when your current downloads complete."
         )
+        return
+    
+    # Process download
+    await handle_download(message.from_user, url)
 
-        await progress_msg.delete()
-        os.remove(temp_path)
-
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        await message.reply(f"❌ Error: {e}")
+# Start queue processing
+asyncio.create_task(process_queue())
 
 if __name__ == "__main__":
     app.run()
