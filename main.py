@@ -15,13 +15,15 @@ from pyrogram import Client, filters, enums
 from pyrogram.types import (
     Message, 
     InlineKeyboardMarkup, 
-    InlineKeyboardButton
+    InlineKeyboardButton,
+    CallbackQuery
 )
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # Constants
 ADMIN_ID = 1562465522
 IST_OFFSET = timedelta(hours=5, minutes=30)  # IST is UTC+5:30
+GROUP_LINK = "https://t.me/+hK0K5vZhV3owMmM1"
 LOADING_STICKERS = [
     "CAACAgUAAxkBAAIFamc51_0aGtMerxmg7w3yLKo-S5YpAAI6EwACtjPQVXt8WJEmWqbsNgQ",
     "CAACAgUAAxkBAAIFbGc52B3b1wABHZq2yVgQxJXe3zWJqAACPhMAAjYz0FV7fFiRJlrG7DYE",
@@ -76,7 +78,9 @@ def format_ist_time(dt):
 
 def get_remaining_time(expires_at):
     remaining = expires_at - get_ist_time()
-    return str(remaining).split('.')[0]
+    hours, remainder = divmod(remaining.seconds, 3600)
+    minutes, _ = divmod(remainder, 60)
+    return f"{hours}h {minutes}m"
 
 def generate_verification_token():
     return secrets.token_urlsafe(12)
@@ -158,6 +162,32 @@ async def add_to_queue(user_id, url):
         'added_at': get_ist_time(),
         'status': 'pending'
     })
+
+async def cancel_user_downloads(user_id):
+    downloads_collection.update_many(
+        {
+            'user_id': user_id,
+            'status': {'$in': ['downloading', 'processing']}
+        },
+        {'$set': {'status': 'cancelled'}}
+    )
+    return downloads_collection.count_documents({'user_id': user_id, 'status': 'cancelled'})
+
+def get_user_stats(user_id):
+    total_downloads = downloads_collection.count_documents({'user_id': user_id})
+    verification_status = get_verification_status(user_id)
+    return {
+        'total_downloads': total_downloads,
+        'verification_status': verification_status
+    }
+
+def get_system_stats():
+    total_users = users_collection.count_documents({})
+    total_downloads = downloads_collection.count_documents({})
+    return {
+        'total_users': total_users,
+        'total_downloads': total_downloads
+    }
 
 async def process_queue():
     while True:
@@ -277,23 +307,17 @@ async def start_handler(client, message):
                 {'_id': verification['_id']},
                 {'$set': {'verified': True, 'used': True}}
             )
-            status = get_verification_status(verification['user_id'])
-            await message.reply(
-                "✅ Verification successful!\n\n"
-                f"• Verified at: {status['created_at']}\n"
-                f"• Expires at: {status['expires_at']}\n"
-                f"• Remaining time: {status['remaining']}"
-            )
+            await message.reply("✅ Verification successful! You can now download videos.")
         else:
             await message.reply("❌ Invalid, expired or already used verification link.")
     else:
         welcome_image = random.choice(WELCOME_IMAGES)
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔍 Check Status", callback_data="check_status")],
             [
                 InlineKeyboardButton("👨‍💻 Developer", url="https://t.me/Opabhik"),
                 InlineKeyboardButton("💻 Source Code", url="https://t.me/True12G")
-            ]
+            ],
+            [InlineKeyboardButton("📢 Join Group", url=GROUP_LINK)]
         ])
         
         try:
@@ -302,7 +326,7 @@ async def start_handler(client, message):
                 caption=(
                     "🚀 Welcome to the Download Bot!\n\n"
                     "Send me a TeraBox link to download and upload.\n"
-                    "You need to verify first if you haven't already."
+                    "Use /status to check your verification status."
                 ),
                 reply_markup=keyboard
             )
@@ -310,38 +334,76 @@ async def start_handler(client, message):
             await message.reply(
                 "🚀 Welcome to the Download Bot!\n\n"
                 "Send me a TeraBox link to download and upload.\n"
-                "You need to verify first if you haven't already.",
+                "Use /status to check your verification status.",
                 reply_markup=keyboard
             )
 
 @app.on_message(filters.command("status"))
 async def status_handler(client, message):
-    status = get_verification_status(message.from_user.id)
-    if status:
+    user_stats = get_user_stats(message.from_user.id)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 System Stats", callback_data="system_stats")]
+    ])
+    
+    if user_stats['verification_status']:
         await message.reply(
-            "🔍 Your Verification Status:\n\n"
-            f"• Verified at: {status['created_at']}\n"
-            f"• Expires at: {status['expires_at']}\n"
-            f"• Remaining time: {status['remaining']}"
+            "🔍 Your Status:\n\n"
+            f"• Verified: ✅\n"
+            f"• Expires at: {user_stats['verification_status']['expires_at']}\n"
+            f"• Remaining: {user_stats['verification_status']['remaining']}\n"
+            f"• Total Downloads: {user_stats['total_downloads']}",
+            reply_markup=keyboard
         )
     else:
-        await message.reply("❌ You are not verified yet. Please verify first when you try to download.")
+        verification_link = await create_verification_link(message.from_user.id)
+        keyboard.inline_keyboard.insert(0, [
+            InlineKeyboardButton("✅ Verify Now", url=verification_link)
+        ])
+        await message.reply(
+            "🔍 Your Status:\n\n"
+            "• Verified: ❌\n"
+            "• You need to verify to download files\n\n"
+            f"Total Downloads: {user_stats['total_downloads']}",
+            reply_markup=keyboard
+        )
+
+@app.on_message(filters.command("restart"))
+async def restart_handler(client, message):
+    cancelled = await cancel_user_downloads(message.from_user.id)
+    await message.reply(f"♻️ Restarted! Cancelled {cancelled} active downloads.")
+
+@app.on_callback_query(filters.regex("^system_stats$"))
+async def system_stats_callback(client, callback_query: CallbackQuery):
+    stats = get_system_stats()
+    await callback_query.edit_message_text(
+        "📊 System Stats:\n\n"
+        f"• Total Users: {stats['total_users']}\n"
+        f"• Total Downloads: {stats['total_downloads']}"
+    )
 
 @app.on_callback_query(filters.regex("^check_status$"))
-async def check_status_callback(client, callback_query):
-    status = get_verification_status(callback_query.from_user.id)
-    if status:
-        await callback_query.edit_message_text(
-            "🔍 Your Verification Status:\n\n"
-            f"• Verified at: {status['created_at']}\n"
-            f"• Expires at: {status['expires_at']}\n"
-            f"• Remaining time: {status['remaining']}"
+async def check_status_callback(client, callback_query: CallbackQuery):
+    user_stats = get_user_stats(callback_query.from_user.id)
+    if user_stats['verification_status']:
+        await callback_query.answer(
+            f"✅ Verified (Expires: {user_stats['verification_status']['expires_at']})",
+            show_alert=True
         )
     else:
-        await callback_query.edit_message_text("❌ You are not verified yet. Please verify first when you try to download.")
+        verification_link = await create_verification_link(callback_query.from_user.id)
+        await callback_query.answer(
+            "❌ You are not verified yet. Please verify first when you try to download.",
+            show_alert=True
+        )
+        await callback_query.message.reply(
+            "🔒 You need to verify before downloading:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Verify Now", url=verification_link)]
+            ])
+        )
 
 @app.on_callback_query(filters.regex("^cancel_download_"))
-async def cancel_download_callback(client, callback_query):
+async def cancel_download_callback(client, callback_query: CallbackQuery):
     download_id = callback_query.data.split("_")[2]
     downloads_collection.update_one(
         {'_id': download_id},
@@ -382,9 +444,10 @@ async def handle_download(user, url, is_from_queue=False):
         # Thumbnail and loading sticker
         loading_sticker = random.choice(LOADING_STICKERS)
         if message:
-            progress_msg = await message.reply_photo(
-                thumbnail, 
-                caption="🔄 Starting download...",
+            # Reply to the original message with progress
+            progress_msg = await message.reply(
+                "🔄 Starting download...",
+                reply_to_message_id=message.id,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel_download_{download_id}")]
                 ])
@@ -413,7 +476,8 @@ async def handle_download(user, url, is_from_queue=False):
                 chat_id=user.id,
                 video=temp_path,
                 caption=f"✅ Upload complete!\nSize: {size / (1024 * 1024):.1f}MB\nTime: {timedelta(seconds=int(time.time() - message.date.timestamp()))}",
-                supports_streaming=True
+                supports_streaming=True,
+                reply_to_message_id=message.id if message else None
             )
 
             if message and progress_msg:
@@ -441,7 +505,7 @@ async def handle_download(user, url, is_from_queue=False):
         if message:
             await message.reply(f"❌ Error: {e}")
 
-@app.on_message(filters.text & ~filters.command(["start", "status"]))
+@app.on_message(filters.text & ~filters.command(["start", "status", "restart"]))
 async def handle_link(client, message):
     url = message.text.strip()
     if "terabox" not in url.lower():
@@ -458,17 +522,14 @@ async def handle_link(client, message):
         verification_link = await create_verification_link(message.from_user.id)
         
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Click to Verify", url=verification_link)],
+            [InlineKeyboardButton("✅ Verify Now", url=verification_link)],
             [InlineKeyboardButton("🔍 Check Status", callback_data="check_status")]
         ])
         
         await message.reply(
-            "🔒 You need to verify before downloading.\n\n"
-            "• Click the button below to verify\n"
-            "• Verification is valid for 8 hours\n"
-            "• All times are in IST (Indian Standard Time)",
+            "🔒 You need to verify before downloading.",
             reply_markup=keyboard,
-            disable_web_page_preview=True
+            reply_to_message_id=message.id
         )
         return
     
@@ -476,12 +537,13 @@ async def handle_link(client, message):
     if await check_user_in_queue(message.from_user.id):
         await add_to_queue(message.from_user.id, url)
         await message.reply(
-            "⏳ You already have 2 active downloads. Your request has been added to queue.\n"
-            "I'll process it when your current downloads complete."
+            "⏳ You already have 2 active downloads. Your request has been added to queue.",
+            reply_to_message_id=message.id
         )
         return
     
     # Process download
+    message.message = message  # Attach message to user object
     await handle_download(message.from_user, url)
 
 async def main():
