@@ -1,7 +1,7 @@
-telethon==1.28.5
-requests==2.31.0
-pymongo==4.5.0
-python-dotenv==1.0.0
-filetype==1.2.0
-fastapi==0.110.0
-uvicorn==0.29.0
+python-dotenv
+requests
+pymongo
+pyrogram
+tgcrypto
+fastapi
+uvicorn
