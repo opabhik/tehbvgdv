@@ -5,14 +5,28 @@ import mimetypes
 import asyncio
 import logging
 import requests
+import threading
 from datetime import timedelta
 from dotenv import load_dotenv
 from pymongo import MongoClient
-from fastapi import FastAPI
 from pyrogram import Client, filters
 from pyrogram.types import Message
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# Fallback for imghdr (Python 3.13+)
+# Dummy HTTP healthcheck server
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+def start_dummy_server():
+    server = HTTPServer(("0.0.0.0", 8000), HealthCheckHandler)
+    server.serve_forever()
+
+threading.Thread(target=start_dummy_server, daemon=True).start()
+
+# Fallback for imghdr
 try:
     import imghdr
 except ImportError:
@@ -22,27 +36,20 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load env
+# Load .env
 load_dotenv()
 API_ID = int(os.getenv("TELEGRAM_API_ID"))
 API_HASH = os.getenv("TELEGRAM_API_HASH")
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 MONGODB_URI = os.getenv("MONGODB_URI")
 
-# MongoDB setup
+# MongoDB
 mongo_client = MongoClient(MONGODB_URI)
 db = mongo_client.get_database("telegram_bot")
 downloads_collection = db.downloads
 
 # Pyrogram client
 app = Client("koyeb_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-# FastAPI health check
-api = FastAPI()
-
-@api.get("/")
-def read_root():
-    return {"status": "ok"}
 
 # Download helper
 async def download_file(url, filename, callback=None):
@@ -65,7 +72,7 @@ async def download_file(url, filename, callback=None):
 
     return total_size
 
-# Progress update
+# Progress UI
 async def show_progress(msg: Message, filename, downloaded, total, speed, eta):
     percent = (downloaded / total) * 100 if total else 0
     bar = "⬢" * int(percent / 5) + "⬡" * (20 - int(percent / 5))
@@ -80,7 +87,7 @@ async def show_progress(msg: Message, filename, downloaded, total, speed, eta):
     except Exception:
         pass
 
-# Main command handler
+# Commands
 @app.on_message(filters.command("start"))
 async def start_handler(client, message):
     await message.reply("🚀 Send me a TeraBox link to download and upload.")
@@ -106,10 +113,10 @@ async def handle_link(client, message):
         filename = f"{title[:50]}{ext}"
         temp_path = f"temp_{filename}"
 
-        # Thumbnail preview
+        # Thumbnail
         progress_msg = await message.reply_photo(thumbnail, caption="🔄 Starting download...")
 
-        # Download with progress
+        # Download
         async def progress_callback(dl, total, spd, eta):
             await show_progress(progress_msg, filename, dl, total, spd, eta)
 
@@ -131,16 +138,5 @@ async def handle_link(client, message):
         logger.error(f"Error: {e}")
         await message.reply(f"❌ Error: {e}")
 
-# Run both bot and FastAPI on Koyeb
 if __name__ == "__main__":
-    import uvicorn
-    from multiprocessing import Process
-
-    def start_fastapi():
-        uvicorn.run(api, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
-
-    def start_bot():
-        app.run()
-
-    Process(target=start_fastapi).start()
-    Process(target=start_bot).start()
+    app.run()
