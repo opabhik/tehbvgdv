@@ -1,0 +1,7 @@
+name: terabox-bot
+routes:
+  - src: /
+    dest: /
+    type: http
+    protocol: http
+    ports: [8080]
