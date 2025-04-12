@@ -51,8 +51,10 @@ downloads_collection = db.downloads
 # Pyrogram client
 app = Client("koyeb_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
+# ... (imports and setup code remain unchanged above)
+
 # Download helper
-async def download_file(url, filename, callback=None):
+async def download_file(url, filename, progress_callback=None):
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
         total_size = int(r.headers.get('content-length', 0))
@@ -60,18 +62,23 @@ async def download_file(url, filename, callback=None):
         start_time = time.time()
 
         with open(filename, 'wb') as f:
-    last_update = time.time()
-    for chunk in r.iter_content(4 * 1024 * 1024)
-        if chunk:
-            f.write(chunk)
-            downloaded += len(chunk)
-            now = time.time()
-            if callback and now - last_update >= 1:
-                elapsed = now - start_time
-                speed = downloaded / elapsed / (1024 * 1024)
-                eta = (total_size - downloaded) / (downloaded / elapsed + 1)
-                await callback(downloaded, total_size, speed, eta)
-                last_update = now
+            last_update = time.time()
+
+            for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):  # 4MB chunks
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+
+                    now = time.time()
+                    if now - last_update >= 1:
+                        elapsed = now - start_time
+                        speed = (downloaded / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                        eta = (total_size - downloaded) / (downloaded / elapsed) if downloaded > 0 else 0
+
+                        if progress_callback:
+                            await progress_callback(downloaded, total_size, speed, eta)
+
+                        last_update = now
     return total_size
 
 # Progress UI
