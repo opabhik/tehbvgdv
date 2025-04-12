@@ -6,7 +6,8 @@ import asyncio
 import logging
 import requests
 import threading
-from datetime import timedelta
+import secrets
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from pyrogram import Client, filters
@@ -47,11 +48,45 @@ MONGODB_URI = os.getenv("MONGODB_URI")
 mongo_client = MongoClient(MONGODB_URI)
 db = mongo_client.get_database("telegram_bot")
 downloads_collection = db.downloads
+verifications_collection = db.verifications
 
 # Pyrogram client
 app = Client("koyeb_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# ... (imports and setup code remain unchanged above)
+def generate_verification_token():
+    return secrets.token_urlsafe(12)
+
+async def create_verification_link(user_id):
+    token = generate_verification_token()
+    expires_at = datetime.now() + timedelta(hours=8)
+    
+    verifications_collection.insert_one({
+        'user_id': user_id,
+        'token': token,
+        'expires_at': expires_at,
+        'verified': False
+    })
+    
+    deep_link = f"https://telegram.me/TempGmailTBot?start=verify-{token}"
+    api_key = os.getenv("LINK4EARN_API")
+    shortener_url = f"https://link4earn.com/api?api={api_key}&url={deep_link}"
+    
+    try:
+        response = requests.get(shortener_url)
+        if response.status_code == 200:
+            return response.json().get('shortenedUrl', deep_link)
+    except Exception:
+        pass
+    
+    return deep_link
+
+def is_user_verified(user_id):
+    verification = verifications_collection.find_one({
+        'user_id': user_id,
+        'verified': True,
+        'expires_at': {'$gt': datetime.now()}
+    })
+    return verification is not None
 
 # Download helper
 async def download_file(url, filename, progress_callback=None):
@@ -64,7 +99,7 @@ async def download_file(url, filename, progress_callback=None):
         with open(filename, 'wb') as f:
             last_update = time.time()
 
-            for chunk in r.iter_content(1024 * 1024):  # 4MB chunks
+            for chunk in r.iter_content(1024 * 1024):
                 if chunk:
                     f.write(chunk)
                     downloaded += len(chunk)
@@ -99,14 +134,41 @@ async def show_progress(msg: Message, filename, downloaded, total, speed, eta):
 # Commands
 @app.on_message(filters.command("start"))
 async def start_handler(client, message):
-    await message.reply("🚀 Send me a TeraBox link to download and upload.")
+    if len(message.command) > 1 and message.command[1].startswith('verify-'):
+        token = message.command[1][7:]
+        verification = verifications_collection.find_one({
+            'token': token,
+            'expires_at': {'$gt': datetime.now()}
+        })
+        
+        if verification:
+            verifications_collection.update_one(
+                {'_id': verification['_id']},
+                {'$set': {'verified': True}}
+            )
+            await message.reply("✅ Verification successful! You can now download videos for the next 8 hours.")
+        else:
+            await message.reply("❌ Invalid or expired verification link.")
+    else:
+        await message.reply("🚀 Send me a TeraBox link to download and upload.")
 
 @app.on_message(filters.text & ~filters.command(["start"]))
 async def handle_link(client, message):
     url = message.text.strip()
     if "terabox" not in url.lower():
         return
-
+    
+    # Check verification
+    if not is_user_verified(message.from_user.id):
+        verification_link = await create_verification_link(message.from_user.id)
+        await message.reply(
+            "🔒 You need to verify before downloading. Please click this link:\n"
+            f"{verification_link}\n"
+            "This verification is valid for 8 hours.",
+            disable_web_page_preview=True
+        )
+        return
+    
     try:
         api = f"https://true12g.in/api/terabox.php?url={url}"
         data = requests.get(api).json()
