@@ -25,9 +25,9 @@ ADMIN_ID = 1562465522
 IST_OFFSET = timedelta(hours=5, minutes=30)  # IST is UTC+5:30
 GROUP_LINK = "https://t.me/+hK0K5vZhV3owMmM1"
 LOADING_STICKERS = [
-    "CAACAgUAAxkBAAICrmcLfBNpxMV_A4j59womoatTkTlHAAIEAAPBJDExieUdbguzyBA2BA",
-    "CAACAgUAAxkBAAICrmcLfBNpxMV_A4j59womoatTkTlHAAIEAAPBJDExieUdbguzyBA2BA",
-    "CAACAgUAAxkBAAICrmcLfBNpxMV_A4j59womoatTkTlHAAIEAAPBJDExieUdbguzyBA2BA"
+    "CAACAgUAAxkBAAIFamc51_0aGtMerxmg7w3yLKo-S5YpAAI6EwACtjPQVXt8WJEmWqbsNgQ",
+    "CAACAgUAAxkBAAIFbGc52B3b1wABHZq2yVgQxJXe3zWJqAACPhMAAjYz0FV7fFiRJlrG7DYE",
+    "CAACAgUAAxkBAAIFbmc52DAAAXwvV4Yw7w3yLKo-S5YpAAI_EwACNjPQVXt8WJEmWqbsNgQ"
 ]
 WELCOME_IMAGES = [
     "https://envs.sh/5OQ.jpg",
@@ -74,9 +74,13 @@ def get_ist_time():
     return datetime.utcnow() + IST_OFFSET
 
 def format_ist_time(dt):
+    if dt is None:
+        return "N/A"
     return dt.strftime('%d-%m-%Y %I:%M %p')
 
 def get_remaining_time(expires_at):
+    if expires_at is None:
+        return "N/A"
     remaining = expires_at - get_ist_time()
     hours, remainder = divmod(remaining.seconds, 3600)
     minutes, _ = divmod(remainder, 60)
@@ -130,9 +134,9 @@ def get_verification_status(user_id):
         return None
     
     return {
-        'created_at': format_ist_time(verification['created_at']),
-        'expires_at': format_ist_time(verification['expires_at']),
-        'remaining': get_remaining_time(verification['expires_at'])
+        'created_at': verification.get('created_at'),
+        'expires_at': verification.get('expires_at'),
+        'remaining': get_remaining_time(verification.get('expires_at'))
     }
 
 async def notify_admin_new_user(user):
@@ -220,34 +224,38 @@ async def process_queue():
             await asyncio.sleep(10)
 
 async def download_file(url, filename, progress_callback=None, cancel_flag=None):
-    with requests.get(url, stream=True, timeout=60) as r:
-        r.raise_for_status()
-        total_size = int(r.headers.get('content-length', 0))
-        downloaded = 0
-        start_time = time.time()
+    try:
+        with requests.get(url, stream=True, timeout=60) as r:
+            r.raise_for_status()
+            total_size = int(r.headers.get('content-length', 0))
+            downloaded = 0
+            start_time = time.time()
 
-        with open(filename, 'wb') as f:
-            last_update = time.time()
+            with open(filename, 'wb') as f:
+                last_update = time.time()
 
-            for chunk in r.iter_content(1024 * 1024):  # 1MB chunks
-                if cancel_flag and cancel_flag.is_set():
-                    raise asyncio.CancelledError("Download cancelled by user")
-                
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
+                for chunk in r.iter_content(1024 * 1024):  # 1MB chunks
+                    if cancel_flag and cancel_flag.is_set():
+                        raise asyncio.CancelledError("Download cancelled by user")
+                    
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
 
-                    now = time.time()
-                    if now - last_update >= 1:
-                        elapsed = now - start_time
-                        speed = (downloaded / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-                        eta = (total_size - downloaded) / (downloaded / elapsed) if downloaded > 0 else 0
+                        now = time.time()
+                        if now - last_update >= 1:
+                            elapsed = now - start_time
+                            speed = (downloaded / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                            eta = (total_size - downloaded) / (downloaded / elapsed) if downloaded > 0 else 0
 
-                        if progress_callback:
-                            await progress_callback(downloaded, total_size, speed, eta)
+                            if progress_callback:
+                                await progress_callback(downloaded, total_size, speed, eta)
 
-                        last_update = now
-    return total_size
+                            last_update = now
+        return total_size
+    except Exception as e:
+        logger.error(f"Download error: {e}")
+        raise
 
 async def show_progress(msg: Message, filename, downloaded, total, speed, eta, cancel_button=None):
     percent = (downloaded / total) * 100 if total else 0
@@ -330,7 +338,8 @@ async def start_handler(client, message):
                 ),
                 reply_markup=keyboard
             )
-        except Exception:
+        except Exception as e:
+            logger.error(f"Error sending welcome image: {e}")
             await message.reply(
                 "🚀 Welcome to the Download Bot!\n\n"
                 "Send me a TeraBox link to download and upload.\n"
@@ -340,77 +349,97 @@ async def start_handler(client, message):
 
 @app.on_message(filters.command("status"))
 async def status_handler(client, message):
-    user_stats = get_user_stats(message.from_user.id)
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 System Stats", callback_data="system_stats")]
-    ])
-    
-    if user_stats['verification_status']:
-        await message.reply(
-            "🔍 Your Status:\n\n"
-            f"• Verified: ✅\n"
-            f"• Expires at: {user_stats['verification_status']['expires_at']}\n"
-            f"• Remaining: {user_stats['verification_status']['remaining']}\n"
-            f"• Total Downloads: {user_stats['total_downloads']}",
-            reply_markup=keyboard
-        )
-    else:
-        verification_link = await create_verification_link(message.from_user.id)
-        keyboard.inline_keyboard.insert(0, [
-            InlineKeyboardButton("✅ Verify Now", url=verification_link)
+    try:
+        user_stats = get_user_stats(message.from_user.id)
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📊 System Stats", callback_data="system_stats")]
         ])
-        await message.reply(
-            "🔍 Your Status:\n\n"
-            "• Verified: ❌\n"
-            "• You need to verify to download files\n\n"
-            f"Total Downloads: {user_stats['total_downloads']}",
-            reply_markup=keyboard
-        )
+        
+        if user_stats['verification_status']:
+            await message.reply(
+                "🔍 Your Status:\n\n"
+                f"• Verified: ✅\n"
+                f"• Expires at: {format_ist_time(user_stats['verification_status']['expires_at'])}\n"
+                f"• Remaining: {user_stats['verification_status']['remaining']}\n"
+                f"• Total Downloads: {user_stats['total_downloads']}",
+                reply_markup=keyboard
+            )
+        else:
+            verification_link = await create_verification_link(message.from_user.id)
+            keyboard.inline_keyboard.insert(0, [
+                InlineKeyboardButton("✅ Verify Now", url=verification_link)
+            ])
+            await message.reply(
+                "🔍 Your Status:\n\n"
+                "• Verified: ❌\n"
+                "• You need to verify to download files\n\n"
+                f"Total Downloads: {user_stats['total_downloads']}",
+                reply_markup=keyboard
+            )
+    except Exception as e:
+        logger.error(f"Error in status handler: {e}")
+        await message.reply("❌ Error fetching your status. Please try again.")
 
 @app.on_message(filters.command("restart"))
 async def restart_handler(client, message):
-    cancelled = await cancel_user_downloads(message.from_user.id)
-    await message.reply(f"♻️ Restarted! Cancelled {cancelled} active downloads.")
+    try:
+        cancelled = await cancel_user_downloads(message.from_user.id)
+        await message.reply(f"♻️ Restarted! Cancelled {cancelled} active downloads.")
+    except Exception as e:
+        logger.error(f"Error in restart handler: {e}")
+        await message.reply("❌ Error restarting. Please try again.")
 
 @app.on_callback_query(filters.regex("^system_stats$"))
 async def system_stats_callback(client, callback_query: CallbackQuery):
-    stats = get_system_stats()
-    await callback_query.edit_message_text(
-        "📊 System Stats:\n\n"
-        f"• Total Users: {stats['total_users']}\n"
-        f"• Total Downloads: {stats['total_downloads']}"
-    )
+    try:
+        stats = get_system_stats()
+        await callback_query.edit_message_text(
+            "📊 System Stats:\n\n"
+            f"• Total Users: {stats['total_users']}\n"
+            f"• Total Downloads: {stats['total_downloads']}"
+        )
+    except Exception as e:
+        logger.error(f"Error in system stats callback: {e}")
+        await callback_query.answer("❌ Error fetching system stats", show_alert=True)
 
 @app.on_callback_query(filters.regex("^check_status$"))
 async def check_status_callback(client, callback_query: CallbackQuery):
-    user_stats = get_user_stats(callback_query.from_user.id)
-    if user_stats['verification_status']:
-        await callback_query.answer(
-            f"✅ Verified (Expires: {user_stats['verification_status']['expires_at']})",
-            show_alert=True
-        )
-    else:
-        verification_link = await create_verification_link(callback_query.from_user.id)
-        await callback_query.answer(
-            "❌ You are not verified yet. Please verify first when you try to download.",
-            show_alert=True
-        )
-        await callback_query.message.reply(
-            "🔒 You need to verify before downloading:",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Verify Now", url=verification_link)]
-            ])
-        )
+    try:
+        user_stats = get_user_stats(callback_query.from_user.id)
+        if user_stats['verification_status']:
+            await callback_query.answer(
+                f"✅ Verified (Expires: {format_ist_time(user_stats['verification_status']['expires_at'])})",
+                show_alert=True
+            )
+        else:
+            verification_link = await create_verification_link(callback_query.from_user.id)
+            await callback_query.answer(
+                "❌ You are not verified yet. Please verify first when you try to download.",
+                show_alert=True
+            )
+            await callback_query.message.reply(
+                "🔒 You need to verify before downloading:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Verify Now", url=verification_link)]
+                ])
+            )
+    except Exception as e:
+        logger.error(f"Error in check status callback: {e}")
+        await callback_query.answer("❌ Error checking status", show_alert=True)
 
 @app.on_callback_query(filters.regex("^cancel_download_"))
 async def cancel_download_callback(client, callback_query: CallbackQuery):
-    download_id = callback_query.data.split("_")[2]
-    downloads_collection.update_one(
-        {'_id': download_id},
-        {'$set': {'status': 'cancelled'}}
-    )
-    await callback_query.answer("Download cancellation requested")
-    await callback_query.edit_message_text("❌ Download cancelled by user")
+    try:
+        download_id = callback_query.data.split("_")[2]
+        downloads_collection.update_one(
+            {'_id': download_id},
+            {'$set': {'status': 'cancelled'}}
+        )
+        await callback_query.answer("Download cancellation requested")
+        await callback_query.edit_message_text("❌ Download cancelled by user")
+    except Exception as e:
+        logger.error(f"Error in cancel download callback: {e}")
+        await callback_query.answer("❌ Error cancelling download", show_alert=True)
 
 async def handle_download(user, url, is_from_queue=False):
     message = user.message if hasattr(user, 'message') else None
@@ -444,7 +473,6 @@ async def handle_download(user, url, is_from_queue=False):
         # Thumbnail and loading sticker
         loading_sticker = random.choice(LOADING_STICKERS)
         if message:
-            # Reply to the original message with progress
             progress_msg = await message.reply(
                 "🔄 Starting download...",
                 reply_to_message_id=message.id,
@@ -475,7 +503,7 @@ async def handle_download(user, url, is_from_queue=False):
             await app.send_video(
                 chat_id=user.id,
                 video=temp_path,
-                caption=f"✅ Upload complete!\nSize: {size / (1024 * 1024):.1f}MB\nTime: {timedelta(seconds=int(time.time() - message.date.timestamp()))}",
+                caption=f"✅ Upload complete!\nSize: {size / (1024 * 1024):.1f}MB",
                 supports_streaming=True,
                 reply_to_message_id=message.id if message else None
             )
