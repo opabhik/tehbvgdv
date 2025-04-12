@@ -60,16 +60,18 @@ async def download_file(url, filename, callback=None):
         start_time = time.time()
 
         with open(filename, 'wb') as f:
-            for chunk in r.iter_content(1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if callback:
-                        elapsed = time.time() - start_time
-                        speed = downloaded / elapsed / (1024 * 1024)
-                        eta = (total_size - downloaded) / (speed * 1024 * 1024 + 1)
-                        await callback(downloaded, total_size, speed, eta)
-
+    last_update = time.time()
+    for chunk in r.iter_content(4 * 1024 * 1024)
+        if chunk:
+            f.write(chunk)
+            downloaded += len(chunk)
+            now = time.time()
+            if callback and now - last_update >= 1:
+                elapsed = now - start_time
+                speed = downloaded / elapsed / (1024 * 1024)
+                eta = (total_size - downloaded) / (downloaded / elapsed + 1)
+                await callback(downloaded, total_size, speed, eta)
+                last_update = now
     return total_size
 
 # Progress UI
