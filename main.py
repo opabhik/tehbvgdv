@@ -11,8 +11,9 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from http.server import BaseHTTPRequestHandler, HTTPServer
+import pytz
 
 # Dummy HTTP healthcheck server
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -27,12 +28,6 @@ def start_dummy_server():
 
 threading.Thread(target=start_dummy_server, daemon=True).start()
 
-# Fallback for imghdr
-try:
-    import imghdr
-except ImportError:
-    import filetype as imghdr
-
 # Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -43,6 +38,7 @@ API_ID = int(os.getenv("TELEGRAM_API_ID"))
 API_HASH = os.getenv("TELEGRAM_API_HASH")
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 MONGODB_URI = os.getenv("MONGODB_URI")
+LINK4EARN_API = os.getenv("LINK4EARN_API")
 
 # MongoDB
 mongo_client = MongoClient(MONGODB_URI)
@@ -53,40 +49,62 @@ verifications_collection = db.verifications
 # Pyrogram client
 app = Client("koyeb_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
+# Helper functions
 def generate_verification_token():
     return secrets.token_urlsafe(12)
 
+async def shorten_url(url):
+    api_url = f"https://link4earn.com/api?api={LINK4EARN_API}&url={url}&format=text"
+    try:
+        response = requests.get(api_url)
+        if response.status_code == 200:
+            return response.text.strip()
+    except Exception as e:
+        logger.error(f"Link shortening error: {e}")
+    return url
+
 async def create_verification_link(user_id):
     token = generate_verification_token()
-    expires_at = datetime.now() + timedelta(hours=8)
+    expires_at = datetime.now(pytz.timezone('Asia/Kolkata')) + timedelta(hours=8)
     
     verifications_collection.insert_one({
         'user_id': user_id,
         'token': token,
+        'created_at': datetime.now(pytz.timezone('Asia/Kolkata')),
         'expires_at': expires_at,
         'verified': False
     })
     
-    deep_link = f"https://telegram.me/TempGmailTBot?start=verify-{token}"
-    api_key = os.getenv("LINK4EARN_API")
-    shortener_url = f"https://link4earn.com/api?api={api_key}&url={deep_link}"
-    
-    try:
-        response = requests.get(shortener_url)
-        if response.status_code == 200:
-            return response.json().get('shortenedUrl', deep_link)
-    except Exception:
-        pass
-    
-    return deep_link
+    deep_link = f"https://telegram.me/iPopKorniaBot?start=verify-{token}"
+    shortened_url = await shorten_url(deep_link)
+    return shortened_url
 
 def is_user_verified(user_id):
     verification = verifications_collection.find_one({
         'user_id': user_id,
         'verified': True,
-        'expires_at': {'$gt': datetime.now()}
+        'expires_at': {'$gt': datetime.now(pytz.timezone('Asia/Kolkata'))}
     })
     return verification is not None
+
+def get_verification_status(user_id):
+    verification = verifications_collection.find_one({
+        'user_id': user_id,
+        'verified': True
+    }, sort=[('expires_at', -1)])
+    
+    if not verification:
+        return None
+    
+    india_tz = pytz.timezone('Asia/Kolkata')
+    created_at = verification['created_at'].astimezone(india_tz)
+    expires_at = verification['expires_at'].astimezone(india_tz)
+    
+    return {
+        'created_at': created_at.strftime('%d-%m-%Y %I:%M %p'),
+        'expires_at': expires_at.strftime('%d-%m-%Y %I:%M %p'),
+        'remaining': expires_at - datetime.now(india_tz)
+    }
 
 # Download helper
 async def download_file(url, filename, progress_callback=None):
@@ -99,7 +117,7 @@ async def download_file(url, filename, progress_callback=None):
         with open(filename, 'wb') as f:
             last_update = time.time()
 
-            for chunk in r.iter_content(1024 * 1024):
+            for chunk in r.iter_content(1024 * 1024):  # 1MB chunks
                 if chunk:
                     f.write(chunk)
                     downloaded += len(chunk)
@@ -138,7 +156,7 @@ async def start_handler(client, message):
         token = message.command[1][7:]
         verification = verifications_collection.find_one({
             'token': token,
-            'expires_at': {'$gt': datetime.now()}
+            'expires_at': {'$gt': datetime.now(pytz.timezone('Asia/Kolkata'))}
         })
         
         if verification:
@@ -146,13 +164,53 @@ async def start_handler(client, message):
                 {'_id': verification['_id']},
                 {'$set': {'verified': True}}
             )
-            await message.reply("✅ Verification successful! You can now download videos for the next 8 hours.")
+            status = get_verification_status(verification['user_id'])
+            await message.reply(
+                "✅ Verification successful!\n\n"
+                f"• Verified at: {status['created_at']}\n"
+                f"• Expires at: {status['expires_at']}\n"
+                f"• Remaining time: {str(status['remaining']).split('.')[0]}"
+            )
         else:
             await message.reply("❌ Invalid or expired verification link.")
     else:
-        await message.reply("🚀 Send me a TeraBox link to download and upload.")
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔍 Check Verification Status", callback_data="check_status")]
+        ])
+        await message.reply(
+            "🚀 Welcome to the Download Bot!\n\n"
+            "Send me a TeraBox link to download and upload.\n"
+            "You need to verify first if you haven't already.",
+            reply_markup=keyboard
+        )
 
-@app.on_message(filters.text & ~filters.command(["start"]))
+@app.on_message(filters.command("status"))
+async def status_handler(client, message):
+    status = get_verification_status(message.from_user.id)
+    if status:
+        await message.reply(
+            "🔍 Your Verification Status:\n\n"
+            f"• Verified at: {status['created_at']}\n"
+            f"• Expires at: {status['expires_at']}\n"
+            f"• Remaining time: {str(status['remaining']).split('.')[0]}"
+        )
+    else:
+        await message.reply("❌ You are not verified yet. Please verify first when you try to download.")
+
+@app.on_callback_query(filters.regex("^check_status$"))
+async def check_status_callback(client, callback_query):
+    status = get_verification_status(callback_query.from_user.id)
+    if status:
+        await callback_query.edit_message_text(
+            "🔍 Your Verification Status:\n\n"
+            f"• Verified at: {status['created_at']}\n"
+            f"• Expires at: {status['expires_at']}\n"
+            f"• Remaining time: {str(status['remaining']).split('.')[0]}"
+        )
+    else:
+        await callback_query.edit_message_text("❌ You are not verified yet. Please verify first when you try to download.")
+
+@app.on_message(filters.text & ~filters.command(["start", "status"]))
 async def handle_link(client, message):
     url = message.text.strip()
     if "terabox" not in url.lower():
@@ -161,10 +219,18 @@ async def handle_link(client, message):
     # Check verification
     if not is_user_verified(message.from_user.id):
         verification_link = await create_verification_link(message.from_user.id)
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Click to Verify", url=verification_link)],
+            [InlineKeyboardButton("🔍 Check Status", callback_data="check_status")]
+        ])
+        
         await message.reply(
-            "🔒 You need to verify before downloading. Please click this link:\n"
-            f"{verification_link}\n"
-            "This verification is valid for 8 hours.",
+            "🔒 You need to verify before downloading.\n\n"
+            "• Click the button below to verify\n"
+            "• Verification is valid for 8 hours\n"
+            "• All times are in IST (Indian Standard Time)",
+            reply_markup=keyboard,
             disable_web_page_preview=True
         )
         return
