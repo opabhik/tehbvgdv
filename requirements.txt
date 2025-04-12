@@ -5,3 +5,4 @@ pyrogram
 tgcrypto
 fastapi
 uvicorn
+pytz
