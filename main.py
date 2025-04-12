@@ -15,25 +15,18 @@ from pyrogram import Client, filters, enums
 from pyrogram.types import (
     Message, 
     InlineKeyboardMarkup, 
-    InlineKeyboardButton,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove
+    InlineKeyboardButton
 )
-from pyrogram.errors import FloodWait
 from http.server import BaseHTTPRequestHandler, HTTPServer
-import pytz
 
-# Admin ID
+# Constants
 ADMIN_ID = 1562465522
-
-# Stickers for loading animation
+IST_OFFSET = timedelta(hours=5, minutes=30)  # IST is UTC+5:30
 LOADING_STICKERS = [
     "CAACAgUAAxkBAAIFamc51_0aGtMerxmg7w3yLKo-S5YpAAI6EwACtjPQVXt8WJEmWqbsNgQ",
     "CAACAgUAAxkBAAIFbGc52B3b1wABHZq2yVgQxJXe3zWJqAACPhMAAjYz0FV7fFiRJlrG7DYE",
     "CAACAgUAAxkBAAIFbmc52DAAAXwvV4Yw7w3yLKo-S5YpAAI_EwACNjPQVXt8WJEmWqbsNgQ"
 ]
-
-# Welcome images
 WELCOME_IMAGES = [
     "https://envs.sh/5OQ.jpg",
     "https://envs.sh/5OK.jpg",
@@ -74,10 +67,17 @@ verifications_collection = db.verifications
 users_collection = db.users
 queue_collection = db.queue
 
-# Pyrogram client
-app = Client("koyeb_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# Helper functions for IST time
+def get_ist_time():
+    return datetime.utcnow() + IST_OFFSET
 
-# Helper functions
+def format_ist_time(dt):
+    return dt.strftime('%d-%m-%Y %I:%M %p')
+
+def get_remaining_time(expires_at):
+    remaining = expires_at - get_ist_time()
+    return str(remaining).split('.')[0]
+
 def generate_verification_token():
     return secrets.token_urlsafe(12)
 
@@ -93,12 +93,12 @@ async def shorten_url(url):
 
 async def create_verification_link(user_id):
     token = generate_verification_token()
-    expires_at = datetime.now(pytz.timezone('Asia/Kolkata')) + timedelta(hours=8)
+    expires_at = get_ist_time() + timedelta(hours=8)
     
     verifications_collection.insert_one({
         'user_id': user_id,
         'token': token,
-        'created_at': datetime.now(pytz.timezone('Asia/Kolkata')),
+        'created_at': get_ist_time(),
         'expires_at': expires_at,
         'verified': False,
         'used': False
@@ -112,7 +112,7 @@ def is_user_verified(user_id):
     verification = verifications_collection.find_one({
         'user_id': user_id,
         'verified': True,
-        'expires_at': {'$gt': datetime.now(pytz.timezone('Asia/Kolkata'))}
+        'expires_at': {'$gt': get_ist_time()}
     })
     return verification is not None
 
@@ -125,14 +125,10 @@ def get_verification_status(user_id):
     if not verification:
         return None
     
-    india_tz = pytz.timezone('Asia/Kolkata')
-    created_at = verification['created_at'].astimezone(india_tz)
-    expires_at = verification['expires_at'].astimezone(india_tz)
-    
     return {
-        'created_at': created_at.strftime('%d-%m-%Y %I:%M %p'),
-        'expires_at': expires_at.strftime('%d-%m-%Y %I:%M %p'),
-        'remaining': expires_at - datetime.now(india_tz)
+        'created_at': format_ist_time(verification['created_at']),
+        'expires_at': format_ist_time(verification['expires_at']),
+        'remaining': get_remaining_time(verification['expires_at'])
     }
 
 async def notify_admin_new_user(user):
@@ -142,7 +138,7 @@ async def notify_admin_new_user(user):
             f"• Name: {user.first_name} {user.last_name or ''}\n"
             f"• Username: @{user.username}\n"
             f"• ID: {user.id}\n"
-            f"• Joined at: {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%d-%m-%Y %I:%M %p')}"
+            f"• Joined at: {format_ist_time(get_ist_time())}"
         )
         await app.send_message(ADMIN_ID, user_info)
     except Exception as e:
@@ -159,7 +155,7 @@ async def add_to_queue(user_id, url):
     queue_collection.insert_one({
         'user_id': user_id,
         'url': url,
-        'added_at': datetime.now(pytz.timezone('Asia/Kolkata')),
+        'added_at': get_ist_time(),
         'status': 'pending'
     })
 
@@ -193,7 +189,6 @@ async def process_queue():
             logger.error(f"Queue processing error: {e}")
             await asyncio.sleep(10)
 
-# Download helper
 async def download_file(url, filename, progress_callback=None, cancel_flag=None):
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
@@ -224,7 +219,6 @@ async def download_file(url, filename, progress_callback=None, cancel_flag=None)
                         last_update = now
     return total_size
 
-# Progress UI
 async def show_progress(msg: Message, filename, downloaded, total, speed, eta, cancel_button=None):
     percent = (downloaded / total) * 100 if total else 0
     bar = "⬢" * int(percent / 5) + "⬡" * (20 - int(percent / 5))
@@ -248,7 +242,14 @@ async def show_progress(msg: Message, filename, downloaded, total, speed, eta, c
     except Exception as e:
         logger.error(f"Error updating progress: {e}")
 
-# Commands
+# Pyrogram client
+app = Client(
+    "koyeb_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
+
 @app.on_message(filters.command("start"))
 async def start_handler(client, message):
     # Check if new user
@@ -259,7 +260,7 @@ async def start_handler(client, message):
             'username': user.username,
             'first_name': user.first_name,
             'last_name': user.last_name,
-            'joined_at': datetime.now(pytz.timezone('Asia/Kolkata'))
+            'joined_at': get_ist_time()
         })
         await notify_admin_new_user(user)
     
@@ -267,7 +268,7 @@ async def start_handler(client, message):
         token = message.command[1][7:]
         verification = verifications_collection.find_one({
             'token': token,
-            'expires_at': {'$gt': datetime.now(pytz.timezone('Asia/Kolkata'))},
+            'expires_at': {'$gt': get_ist_time()},
             'used': False
         })
         
@@ -281,7 +282,7 @@ async def start_handler(client, message):
                 "✅ Verification successful!\n\n"
                 f"• Verified at: {status['created_at']}\n"
                 f"• Expires at: {status['expires_at']}\n"
-                f"• Remaining time: {str(status['remaining']).split('.')[0]}"
+                f"• Remaining time: {status['remaining']}"
             )
         else:
             await message.reply("❌ Invalid, expired or already used verification link.")
@@ -321,7 +322,7 @@ async def status_handler(client, message):
             "🔍 Your Verification Status:\n\n"
             f"• Verified at: {status['created_at']}\n"
             f"• Expires at: {status['expires_at']}\n"
-            f"• Remaining time: {str(status['remaining']).split('.')[0]}"
+            f"• Remaining time: {status['remaining']}"
         )
     else:
         await message.reply("❌ You are not verified yet. Please verify first when you try to download.")
@@ -334,7 +335,7 @@ async def check_status_callback(client, callback_query):
             "🔍 Your Verification Status:\n\n"
             f"• Verified at: {status['created_at']}\n"
             f"• Expires at: {status['expires_at']}\n"
-            f"• Remaining time: {str(status['remaining']).split('.')[0]}"
+            f"• Remaining time: {status['remaining']}"
         )
     else:
         await callback_query.edit_message_text("❌ You are not verified yet. Please verify first when you try to download.")
@@ -375,7 +376,7 @@ async def handle_download(user, url, is_from_queue=False):
             'filename': filename,
             'url': url,
             'status': 'downloading',
-            'started_at': datetime.now(pytz.timezone('Asia/Kolkata'))
+            'started_at': get_ist_time()
         }).inserted_id
 
         # Thumbnail and loading sticker
@@ -483,8 +484,18 @@ async def handle_link(client, message):
     # Process download
     await handle_download(message.from_user, url)
 
-# Start queue processing
-asyncio.create_task(process_queue())
+async def main():
+    await app.start()
+    # Start queue processing in background
+    asyncio.create_task(process_queue())
+    await asyncio.Event().wait()  # Run forever
 
 if __name__ == "__main__":
-    app.run()
+    # Properly start the asyncio event loop
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        loop.close()
