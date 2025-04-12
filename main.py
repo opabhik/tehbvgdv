@@ -64,7 +64,7 @@ async def download_file(url, filename, progress_callback=None):
         with open(filename, 'wb') as f:
             last_update = time.time()
 
-            for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):  # 4MB chunks
+            for chunk in r.iter_content(1024 * 1024):  # 4MB chunks
                 if chunk:
                     f.write(chunk)
                     downloaded += len(chunk)
