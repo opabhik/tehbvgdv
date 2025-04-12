@@ -1,8 +1,8 @@
-python-dotenv
-requests
-pymongo
-pyrogram
-tgcrypto
-fastapi
-uvicorn
-pytz
+python-dotenv==1.0.0
+requests==2.31.0
+pymongo==4.5.0
+pyrogram==2.0.106
+tgcrypto==1.2.5
+fastapi==0.95.2
+uvicorn==0.22.0
+pytz==2023.3
