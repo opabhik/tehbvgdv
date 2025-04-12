@@ -1,6 +1,6 @@
 #!/usr/bin/env python3 import os import asyncio import requests import time import mimetypes from datetime import timedelta from pymongo import MongoClient from dotenv import load_dotenv from telethon import TelegramClient, events, types from fastapi import FastAPI import uvicorn import logging import threading
 
-Fix imghdr removal in Python 3.13+
+# Fix imghdr removal in Python 3.13+
 
 try: import imghdr except ImportError: import filetype as imghdr
 
