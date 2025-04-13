@@ -69,6 +69,7 @@ LINK4EARN_API = os.getenv("LINK4EARN_API")
 
 # MongoDB Initialization
 
+# MongoDB Initialization
 def initialize_mongodb():
     try:
         mongo_client = MongoClient(MONGODB_URI)
@@ -108,11 +109,11 @@ def initialize_mongodb():
     except Exception as e:
         logger.error(f"Failed to initialize MongoDB: {e}")
         raise
+
 try:
     mongo_client, db, downloads_collection, verifications_collection, users_collection = initialize_mongodb()
 except Exception as e:
     logger.error(f"Critical MongoDB initialization error: {e}")
-    # Add retry logic or exit gracefully
     exit(1)
 
 # Helper functions
