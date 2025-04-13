@@ -335,7 +335,7 @@ async def download_with_retry(url, filename, progress_callback, user_id):
                                 elapsed = now - start_time
                                 speed = downloaded / elapsed if elapsed > 0 else 0
                                 eta = (total_size - downloaded) / speed if speed > 0 else 0
-                                await progress_callback(downloaded, total_size, speed, eta, filename)
+                                await progress_callback(downloaded, total_size, speed, eta)
                                 last_update = now
                     return total_size
             except Exception as e:
@@ -346,7 +346,7 @@ async def download_with_retry(url, filename, progress_callback, user_id):
     finally:
         active_downloads.pop(user_id, None)
 
-def format_progress(filename, downloaded, total, speed, eta, thumbnail_url=None):
+def format_progress(filename, downloaded, total, speed, eta):
     percent = (downloaded / total) * 100
     filled = int(percent / 5)
     progress_bar = '▰' * filled + '▱' * (20 - filled)
@@ -550,56 +550,92 @@ async def handle_link(client, message):
         )
         return
     
+    # Initial rocket message
+    rocket_msg = await message.reply("🚀")
+    
     user_status = get_verification_status(message.from_user.id)
     if user_status['status'] != 'verified':
         verification_link = await create_verification_link(message.from_user.id)
-        await message.reply(
+        await rocket_msg.edit_text(
             "🔒 <b>Verification Required</b>\n\n"
             "<i>Please verify to access download features</i>",
             parse_mode=enums.ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔗 Verify Now", url=verification_link)],
                 [InlineKeyboardButton("📹 Tutorial", url=VERIFY_TUTORIAL)]
-            ]),
-            reply_to_message_id=message.id
+            ])
         )
         return
     
     try:
-        # Immediately show download starting
-        filename = url.split('/')[-1][:50] or f"file_{int(time.time())}"
-        progress_msg = await message.reply(
-            f"<b>📥 Starting Download:</b> <code>{filename}</code>\n\n"
-            f"<b>👤 User:</b> {message.from_user.first_name} [<code>{message.from_user.id}</code>]\n"
-            f"<i>⚡ Connecting to high-speed server...</i>",
-            parse_mode=enums.ParseMode.HTML
-        )
-        
         # Get video info
         api_url = f"https://true12g.in/api/terabox.php?url={url}"
         try:
             api_response = requests.get(api_url, timeout=15).json()
         except Exception as e:
             logger.error(f"API request failed: {str(e)}")
-            await progress_msg.edit_text("❌ <b>Failed to fetch download info</b>", parse_mode=enums.ParseMode.HTML)
+            await rocket_msg.edit_text("❌ <b>Failed to fetch download info</b>", parse_mode=enums.ParseMode.HTML)
             return
             
         if not api_response.get('response'):
-            await progress_msg.edit_text("❌ <b>Invalid link or content not available</b>", parse_mode=enums.ParseMode.HTML)
+            await rocket_msg.edit_text("❌ <b>Invalid link or content not available</b>", parse_mode=enums.ParseMode.HTML)
             return
             
         file_info = api_response['response'][0]
         dl_url = file_info['resolutions'].get('HD Video')
         thumbnail = file_info.get('thumbnail', '')
-        title = file_info.get('title', filename)
+        title = file_info.get('title', url.split('/')[-1][:50])
         duration = file_info.get('duration', 'N/A')
         ext = mimetypes.guess_extension(requests.head(dl_url).headers.get('content-type', '')) or '.mp4'
         filename = f"{title[:50]}{ext}"
         temp_path = f"temp_{filename}"
         
+        # Send thumbnail with starting message
+        try:
+            if thumbnail:
+                # Download thumbnail
+                thumb_path = f"thumb_{message.from_user.id}.jpg"
+                with requests.get(thumbnail, stream=True, timeout=10) as r:
+                    r.raise_for_status()
+                    with open(thumb_path, 'wb') as f:
+                        for chunk in r.iter_content(1024):
+                            f.write(chunk)
+                
+                # Edit rocket message with thumbnail
+                await rocket_msg.delete()
+                progress_msg = await message.reply_photo(
+                    photo=thumb_path,
+                    caption=(
+                        f"<b>📥 Starting Download:</b> <code>{filename}</code>\n\n"
+                        f"<b>👤 User:</b> {message.from_user.first_name} [<code>{message.from_user.id}</code>]\n"
+                        f"<i>⚡ Connecting to high-speed server...</i>"
+                    ),
+                    parse_mode=enums.ParseMode.HTML
+                )
+                
+                # Remove thumbnail file
+                os.remove(thumb_path)
+            else:
+                await rocket_msg.edit_text(
+                    f"<b>📥 Starting Download:</b> <code>{filename}</code>\n\n"
+                    f"<b>👤 User:</b> {message.from_user.first_name} [<code>{message.from_user.id}</code>]\n"
+                    f"<i>⚡ Connecting to high-speed server...</i>",
+                    parse_mode=enums.ParseMode.HTML
+                )
+                progress_msg = rocket_msg
+        except Exception as e:
+            logger.error(f"Error sending thumbnail: {e}")
+            await rocket_msg.edit_text(
+                f"<b>📥 Starting Download:</b> <code>{filename}</code>\n\n"
+                f"<b>👤 User:</b> {message.from_user.first_name} [<code>{message.from_user.id}</code>]\n"
+                f"<i>⚡ Connecting to high-speed server...</i>",
+                parse_mode=enums.ParseMode.HTML
+            )
+            progress_msg = rocket_msg
+        
         # Update with progress
         async def update_progress(downloaded, total, speed, eta):
-            progress_text = format_progress(filename, downloaded, total, speed, eta, thumbnail)
+            progress_text = format_progress(filename, downloaded, total, speed, eta)
             try:
                 await progress_msg.edit_text(
                     progress_text + 
