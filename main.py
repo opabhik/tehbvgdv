@@ -25,8 +25,9 @@ WELCOME_IMAGES = [
     "https://envs.sh/zmX.jpg",
     "https://envs.sh/zm6.jpg"
 ]
-DOWNLOAD_TIMEOUT = 30
-MAX_RETRIES = 1
+DOWNLOAD_TIMEOUT = 45
+MAX_RETRIES = 2
+CHUNK_SIZE = 2 * 1024 * 1024  # 2MB chunks for upload
 
 # Global variable to track active downloads
 active_downloads = {}
@@ -108,7 +109,11 @@ async def notify_admin_new_user(user):
     try:
         await app.send_message(
             ADMIN_ID,
-            f"👤 New User:\n\nName: {user.first_name}\nUsername: @{user.username}\nID: {user.id}"
+            f"<b>👤 New User</b>\n\n"
+            f"<b>Name:</b> {user.first_name}\n"
+            f"<b>Username:</b> @{user.username}\n"
+            f"<b>ID:</b> <code>{user.id}</code>",
+            parse_mode=enums.ParseMode.HTML
         )
     except Exception as e:
         logger.error(f"Admin notify error: {e}")
@@ -125,8 +130,12 @@ async def notify_admin_download(user, filename, size, video_file_id):
         # Send download info
         await app.send_message(
             ADMIN_ID,
-            f"📥 New Download:\n\nFile: {filename}\nSize: {size/(1024*1024):.1f}MB\n"
-            f"User: {user.first_name} (@{user.username})\nID: {user.id}"
+            f"<b>📥 New Download</b>\n\n"
+            f"<b>File:</b> <code>{filename}</code>\n"
+            f"<b>Size:</b> {size/(1024*1024):.1f}MB\n"
+            f"<b>User:</b> {user.first_name} (@{user.username})\n"
+            f"<b>ID:</b> <code>{user.id}</code>",
+            parse_mode=enums.ParseMode.HTML
         )
     except Exception as e:
         logger.error(f"Download notify error: {e}")
@@ -144,7 +153,7 @@ async def download_with_retry(url, filename, progress_callback, user_id):
                     last_update = start_time
 
                     with open(filename, 'wb') as f:
-                        for chunk in r.iter_content(1024 * 1024):
+                        for chunk in r.iter_content(CHUNK_SIZE):
                             if not active_downloads.get(user_id, False):
                                 raise asyncio.CancelledError("Download cancelled")
                                 
@@ -152,7 +161,7 @@ async def download_with_retry(url, filename, progress_callback, user_id):
                             downloaded += len(chunk)
                             
                             now = time.time()
-                            if now - last_update >= 1:
+                            if now - last_update >= 1:  # Update every 1 second
                                 elapsed = now - start_time
                                 speed = downloaded / elapsed if elapsed > 0 else 0
                                 eta = (total_size - downloaded) / speed if speed > 0 else 0
@@ -170,19 +179,29 @@ async def download_with_retry(url, filename, progress_callback, user_id):
 def format_progress(filename, downloaded, total, speed, eta):
     percent = (downloaded / total) * 100
     filled = int(percent / 5)
-    bar = '▓' * filled + '░' * (20 - filled)
+    bar = '⬢' * filled + '⬡' * (20 - filled)
     
-    hours, remainder = divmod(eta, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    eta_str = f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}" if hours > 0 else f"{int(minutes):02d}:{int(seconds):02d} minutes"
+    # Format speed
+    if speed > 1024*1024:
+        speed_str = f"{speed/(1024*1024):.2f} MB/s"
+    else:
+        speed_str = f"{speed/1024:.2f} KB/s"
+    
+    # Format ETA
+    if eta > 3600:
+        eta_str = f"{int(eta//3600)}h {int((eta%3600)//60)}m"
+    elif eta > 60:
+        eta_str = f"{int(eta//60)}m {int(eta%60)}s"
+    else:
+        eta_str = f"{int(eta)}s"
     
     return (
-        f"{filename}\n"
-        f"[{bar}] {percent:.2f}%\n"
-        f"Downloaded: {downloaded/(1024*1024):.2f} MB / {total/(1024*1024):.2f} MB\n"
-        f"Status: Downloading\n"
-        f"Speed: {speed/(1024*1024):.2f} MB/s\n"
-        f"ETA: {eta_str}"
+        f"<b>📥 Downloading:</b> <code>{filename}</code>\n\n"
+        f"<b>Progress:</b> {bar} {percent:.1f}%\n"
+        f"<b>Size:</b> {downloaded/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB\n"
+        f"<b>Speed:</b> {speed_str}\n"
+        f"<b>ETA:</b> {eta_str}\n\n"
+        f"<i>🚀 Powered by @iPopKorniaBot</i>"
     )
 
 # Pyrogram client
@@ -191,8 +210,8 @@ app = Client(
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workers=50,
-    max_concurrent_transmissions=10
+    workers=100,
+    max_concurrent_transmissions=20
 )
 
 @app.on_message(filters.command("start"))
@@ -214,22 +233,31 @@ async def start_handler(client, message):
             {'token': token, 'used': False, 'expires_at': {'$gt': get_ist_time()}},
             {'$set': {'verified': True, 'used': True}}
         )
-        await message.reply("✅ Verified!" if verification else "❌ Invalid link")
+        await message.reply("✅ <b>Verified successfully!</b>", parse_mode=enums.ParseMode.HTML)
     else:
         try:
             await message.reply_photo(
                 random.choice(WELCOME_IMAGES),
-                caption="🚀 Send me a TeraBox link to download",
+                caption=(
+                    "<b>🚀 Welcome to iPopKornia Downloader Bot</b>\n\n"
+                    "📌 <i>Send me any TeraBox link to download</i>\n\n"
+                    "🔗 <i>Fastest downloads with premium speed</i>"
+                ),
+                parse_mode=enums.ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
                     [
-                        InlineKeyboardButton("Developer", url="https://t.me/Opabhik"),
-                        InlineKeyboardButton("Source", url="https://t.me/True12G")
+                        InlineKeyboardButton("👨‍💻 Developer", url="https://t.me/Opabhik"),
+                        InlineKeyboardButton("💻 Source", url="https://t.me/True12G")
                     ],
-                    [InlineKeyboardButton("Join Group", url=GROUP_LINK)]
+                    [InlineKeyboardButton("👥 Join Group", url=GROUP_LINK)]
                 ])
             )
         except Exception:
-            await message.reply("🚀 Send me a TeraBox link to download")
+            await message.reply(
+                "<b>🚀 Welcome to iPopKornia Downloader Bot</b>\n\n"
+                "📌 <i>Send me any TeraBox link to download</i>",
+                parse_mode=enums.ParseMode.HTML
+            )
 
 @app.on_message(filters.command("restart"))
 async def restart_handler(client, message):
@@ -237,38 +265,41 @@ async def restart_handler(client, message):
         # Notify admin about restart
         await app.send_message(
             ADMIN_ID,
-            f"♻️ Bot Restarted by {message.from_user.first_name} (@{message.from_user.username})"
+            f"♻️ <b>Bot Restarted</b>\n\n"
+            f"<b>By:</b> {message.from_user.first_name} (@{message.from_user.username})\n"
+            f"<b>ID:</b> <code>{message.from_user.id}</code>\n"
+            f"<b>Time:</b> {format_ist_time(get_ist_time())}",
+            parse_mode=enums.ParseMode.HTML
         )
-        print(f"Bot restarted by {message.from_user.id} at {get_ist_time()}")
         
         # Cancel all active downloads for this user
         if message.from_user.id in active_downloads:
             active_downloads[message.from_user.id] = False
-            await message.reply("♻️ Restarting... Active downloads cancelled")
+            await message.reply("♻️ <b>Restarting...</b>\n\n⚠️ <i>Active downloads cancelled</i>", parse_mode=enums.ParseMode.HTML)
         else:
-            await message.reply("♻️ Bot restarted successfully")
+            await message.reply("♻️ <b>Bot restarted successfully!</b>", parse_mode=enums.ParseMode.HTML)
     except Exception as e:
         logger.error(f"Restart error: {str(e)}")
-        await message.reply("❌ Error during restart")
+        await message.reply("❌ <b>Error during restart</b>", parse_mode=enums.ParseMode.HTML)
 
 @app.on_message(filters.text & ~filters.command(["start", "status", "restart"]))
 async def handle_link(client, message):
     url = message.text.strip()
-    if "terabox" not in url.lower():
-        return
     
-    # Set random reaction
+    # Set initial reaction
     try:
-        await message.set_reaction(random.choice(["❤️", "🧐"]))
+        await message.set_reaction("👀")
     except Exception:
         pass
     
     if not is_user_verified(message.from_user.id):
         verification_link = await create_verification_link(message.from_user.id)
         await message.reply(
-            "🔒 Please verify first:",
+            "🔒 <b>Verification Required</b>\n\n"
+            "<i>Please verify to access download features</i>",
+            parse_mode=enums.ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Verify Now", url=verification_link)]
+                [InlineKeyboardButton("🔗 Verify Now", url=verification_link)]
             ]),
             reply_to_message_id=message.id
         )
@@ -276,14 +307,21 @@ async def handle_link(client, message):
     
     try:
         # Initial status message
-        status_msg = await message.reply("🔍 Fetching download info...", reply_to_message_id=message.id)
+        status_msg = await message.reply("🔍 <b>Fetching download info...</b>", parse_mode=enums.ParseMode.HTML, reply_to_message_id=message.id)
         
         # Get video info
         api_url = f"https://true12g.in/api/terabox.php?url={url}"
-        api_response = requests.get(api_url, timeout=10).json()
-        
+        try:
+            api_response = requests.get(api_url, timeout=15).json()
+        except Exception as e:
+            logger.error(f"API request failed: {str(e)}")
+            await status_msg.delete()
+            await message.set_reaction("🥲")
+            return
+            
         if not api_response.get('response'):
-            await status_msg.edit("❌ Failed to get download info")
+            await status_msg.delete()
+            await message.set_reaction("🥲")
             return
             
         file_info = api_response['response'][0]
@@ -294,11 +332,22 @@ async def handle_link(client, message):
         filename = f"{title[:50]}{ext}"
         temp_path = f"temp_{filename}"
         
+        # Update reaction to show processing
+        try:
+            await message.set_reaction("⏳")
+        except Exception:
+            pass
+        
         # Update with thumbnail and progress
         progress_msg = await message.reply_photo(
             thumbnail,
-            caption=format_progress(filename, 0, 1, 0, 0) + 
-                   f"\nUser: {message.from_user.first_name} (@{message.from_user.username})",
+            caption=(
+                f"<b>📥 Preparing Download:</b> <code>{filename}</code>\n\n"
+                f"<i>⚡ Initializing high-speed connection...</i>\n\n"
+                f"<b>👤 User:</b> {message.from_user.first_name} (@{message.from_user.username})"
+            ),
+            parse_mode=enums.ParseMode.HTML,
+            has_spoiler=True,
             reply_to_message_id=message.id
         )
         await status_msg.delete()
@@ -307,39 +356,78 @@ async def handle_link(client, message):
         async def update_progress(downloaded, total, speed, eta):
             await progress_msg.edit_caption(
                 format_progress(filename, downloaded, total, speed, eta) +
-                f"\nUser: {message.from_user.first_name} (@{message.from_user.username})"
+                f"\n\n<b>👤 User:</b> {message.from_user.first_name} (@{message.from_user.username})",
+                parse_mode=enums.ParseMode.HTML
             )
         
         # Download file
         try:
             size = await download_with_retry(dl_url, temp_path, update_progress, message.from_user.id)
             
+            # Update reaction to show uploading
+            try:
+                await message.set_reaction("📤")
+            except Exception:
+                pass
+            
             # Upload to Telegram
-            await progress_msg.edit_caption("📤 Uploading to Telegram...")
+            await progress_msg.edit_caption(
+                "📤 <b>Uploading to Telegram...</b>\n\n"
+                "<i>⚡ Using premium bandwidth for fast upload</i>",
+                parse_mode=enums.ParseMode.HTML
+            )
             
             async def upload_progress(current, total):
                 percent = (current / total) * 100
                 await progress_msg.edit_caption(
-                    f"📤 Uploading: {current/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB ({percent:.1f}%)"
+                    f"📤 <b>Uploading:</b> <code>{filename}</code>\n\n"
+                    f"<b>Progress:</b> {current/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB ({percent:.1f}%)\n\n"
+                    f"<i>🚀 Powered by @iPopKorniaBot</i>",
+                    parse_mode=enums.ParseMode.HTML
                 )
             
             sent_message = await app.send_video(
                 chat_id=message.chat.id,
                 video=temp_path,
-                caption=f"✅ {filename}\nSize: {size/(1024*1024):.1f}MB",
+                caption=(
+                    f"✅ <b>Download Complete!</b>\n\n"
+                    f"<b>File:</b> <code>{filename}</code>\n"
+                    f"<b>Size:</b> {size/(1024*1024):.1f}MB\n\n"
+                    f"<i>⚡ Downloaded via @iPopKorniaBot</i>"
+                ),
                 supports_streaming=True,
                 progress=upload_progress,
+                parse_mode=enums.ParseMode.HTML,
+                has_spoiler=True,
                 reply_to_message_id=message.id
             )
+            
+            # Update reaction to show success
+            try:
+                await message.set_reaction("✅")
+            except Exception:
+                pass
             
             await progress_msg.delete()
             await notify_admin_download(message.from_user, filename, size, sent_message.id)
             
         except asyncio.CancelledError:
-            await progress_msg.edit_caption("❌ Download cancelled")
+            await progress_msg.edit_caption("❌ <b>Download cancelled</b>", parse_mode=enums.ParseMode.HTML)
+            try:
+                await message.set_reaction("❌")
+            except Exception:
+                pass
         except Exception as e:
             logger.error(f"Download failed: {str(e)}")
-            await progress_msg.edit_caption("❌ Download failed")
+            await progress_msg.edit_caption(
+                "❌ <b>Download failed</b>\n\n"
+                f"<i>Error: {str(e)}</i>",
+                parse_mode=enums.ParseMode.HTML
+            )
+            try:
+                await message.set_reaction("🥲")
+            except Exception:
+                pass
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
@@ -347,7 +435,15 @@ async def handle_link(client, message):
     except Exception as e:
         logger.error(f"Error: {str(e)}")
         try:
-            await message.reply("❌ An error occurred")
+            await message.set_reaction("🥲")
+        except Exception:
+            pass
+        try:
+            await message.reply(
+                "❌ <b>An error occurred</b>\n\n"
+                f"<i>{str(e)}</i>",
+                parse_mode=enums.ParseMode.HTML
+            )
         except Exception:
             pass
 
@@ -356,7 +452,12 @@ async def main():
     try:
         await app.start()
         print("Bot started successfully")
-        await app.send_message(ADMIN_ID, "🤖 Bot started successfully")
+        await app.send_message(
+            ADMIN_ID,
+            "🤖 <b>Bot started successfully!</b>\n\n"
+            f"<b>Time:</b> {format_ist_time(get_ist_time())}",
+            parse_mode=enums.ParseMode.HTML
+        )
     except Exception as e:
         logger.error(f"Startup error: {str(e)}")
     
