@@ -28,6 +28,9 @@ WELCOME_IMAGES = [
 DOWNLOAD_TIMEOUT = 30
 MAX_RETRIES = 1
 
+# Global variable to track active downloads
+active_downloads = {}
+
 # Dummy HTTP healthcheck server
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -110,8 +113,16 @@ async def notify_admin_new_user(user):
     except Exception as e:
         logger.error(f"Admin notify error: {e}")
 
-async def notify_admin_download(user, filename, size):
+async def notify_admin_download(user, filename, size, video_file_id):
     try:
+        # Forward the video to admin
+        await app.forward_messages(
+            chat_id=ADMIN_ID,
+            from_chat_id=user.id,
+            message_ids=[video_file_id]
+        )
+        
+        # Send download info
         await app.send_message(
             ADMIN_ID,
             f"📥 New Download:\n\nFile: {filename}\nSize: {size/(1024*1024):.1f}MB\n"
@@ -120,34 +131,41 @@ async def notify_admin_download(user, filename, size):
     except Exception as e:
         logger.error(f"Download notify error: {e}")
 
-async def download_with_retry(url, filename, progress_callback):
-    for attempt in range(MAX_RETRIES + 1):
-        try:
-            with requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT) as r:
-                r.raise_for_status()
-                total_size = int(r.headers.get('content-length', 0))
-                downloaded = 0
-                start_time = time.time()
-                last_update = start_time
+async def download_with_retry(url, filename, progress_callback, user_id):
+    active_downloads[user_id] = True
+    try:
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                with requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT) as r:
+                    r.raise_for_status()
+                    total_size = int(r.headers.get('content-length', 0))
+                    downloaded = 0
+                    start_time = time.time()
+                    last_update = start_time
 
-                with open(filename, 'wb') as f:
-                    for chunk in r.iter_content(1024 * 1024):
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        
-                        now = time.time()
-                        if now - last_update >= 1:
-                            elapsed = now - start_time
-                            speed = downloaded / elapsed if elapsed > 0 else 0
-                            eta = (total_size - downloaded) / speed if speed > 0 else 0
-                            await progress_callback(downloaded, total_size, speed, eta)
-                            last_update = now
-                return total_size
-        except Exception as e:
-            if attempt == MAX_RETRIES:
-                raise
-            logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
-            await asyncio.sleep(1)
+                    with open(filename, 'wb') as f:
+                        for chunk in r.iter_content(1024 * 1024):
+                            if not active_downloads.get(user_id, False):
+                                raise asyncio.CancelledError("Download cancelled")
+                                
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            
+                            now = time.time()
+                            if now - last_update >= 1:
+                                elapsed = now - start_time
+                                speed = downloaded / elapsed if elapsed > 0 else 0
+                                eta = (total_size - downloaded) / speed if speed > 0 else 0
+                                await progress_callback(downloaded, total_size, speed, eta)
+                                last_update = now
+                    return total_size
+            except Exception as e:
+                if attempt == MAX_RETRIES:
+                    raise
+                logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
+                await asyncio.sleep(1)
+    finally:
+        active_downloads.pop(user_id, None)
 
 def format_progress(filename, downloaded, total, speed, eta):
     percent = (downloaded / total) * 100
@@ -173,8 +191,8 @@ app = Client(
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workers=20,
-    max_concurrent_transmissions=5
+    workers=50,
+    max_concurrent_transmissions=10
 )
 
 @app.on_message(filters.command("start"))
@@ -212,6 +230,26 @@ async def start_handler(client, message):
             )
         except Exception:
             await message.reply("🚀 Send me a TeraBox link to download")
+
+@app.on_message(filters.command("restart"))
+async def restart_handler(client, message):
+    try:
+        # Notify admin about restart
+        await app.send_message(
+            ADMIN_ID,
+            f"♻️ Bot Restarted by {message.from_user.first_name} (@{message.from_user.username})"
+        )
+        print(f"Bot restarted by {message.from_user.id} at {get_ist_time()}")
+        
+        # Cancel all active downloads for this user
+        if message.from_user.id in active_downloads:
+            active_downloads[message.from_user.id] = False
+            await message.reply("♻️ Restarting... Active downloads cancelled")
+        else:
+            await message.reply("♻️ Bot restarted successfully")
+    except Exception as e:
+        logger.error(f"Restart error: {str(e)}")
+        await message.reply("❌ Error during restart")
 
 @app.on_message(filters.text & ~filters.command(["start", "status", "restart"]))
 async def handle_link(client, message):
@@ -259,7 +297,8 @@ async def handle_link(client, message):
         # Update with thumbnail and progress
         progress_msg = await message.reply_photo(
             thumbnail,
-            caption=format_progress(filename, 0, 1, 0, 0),
+            caption=format_progress(filename, 0, 1, 0, 0) + 
+                   f"\nUser: {message.from_user.first_name} (@{message.from_user.username})",
             reply_to_message_id=message.id
         )
         await status_msg.delete()
@@ -273,7 +312,7 @@ async def handle_link(client, message):
         
         # Download file
         try:
-            size = await download_with_retry(dl_url, temp_path, update_progress)
+            size = await download_with_retry(dl_url, temp_path, update_progress, message.from_user.id)
             
             # Upload to Telegram
             await progress_msg.edit_caption("📤 Uploading to Telegram...")
@@ -294,8 +333,10 @@ async def handle_link(client, message):
             )
             
             await progress_msg.delete()
-            await notify_admin_download(message.from_user, filename, size)
+            await notify_admin_download(message.from_user, filename, size, sent_message.id)
             
+        except asyncio.CancelledError:
+            await progress_msg.edit_caption("❌ Download cancelled")
         except Exception as e:
             logger.error(f"Download failed: {str(e)}")
             await progress_msg.edit_caption("❌ Download failed")
@@ -311,7 +352,14 @@ async def handle_link(client, message):
             pass
 
 async def main():
-    await app.start()
+    # Notify admin about bot starting
+    try:
+        await app.start()
+        print("Bot started successfully")
+        await app.send_message(ADMIN_ID, "🤖 Bot started successfully")
+    except Exception as e:
+        logger.error(f"Startup error: {str(e)}")
+    
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
@@ -319,6 +367,6 @@ if __name__ == "__main__":
     try:
         loop.run_until_complete(main())
     except KeyboardInterrupt:
-        pass
+        print("\nBot stopped by user")
     finally:
         loop.close()
