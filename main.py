@@ -25,8 +25,8 @@ WELCOME_IMAGES = [
     "https://envs.sh/zmX.jpg",
     "https://envs.sh/zm6.jpg"
 ]
-MAX_RETRIES = 1  # Only try once
-DOWNLOAD_TIMEOUT = 30  # 30 seconds timeout
+DOWNLOAD_TIMEOUT = 30
+MAX_RETRIES = 1
 
 # Dummy HTTP healthcheck server
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -110,7 +110,16 @@ async def notify_admin_new_user(user):
     except Exception as e:
         logger.error(f"Admin notify error: {e}")
 
-# Download with retry and timeout
+async def notify_admin_download(user, filename, size):
+    try:
+        await app.send_message(
+            ADMIN_ID,
+            f"📥 New Download:\n\nFile: {filename}\nSize: {size/(1024*1024):.1f}MB\n"
+            f"User: {user.first_name} (@{user.username})\nID: {user.id}"
+        )
+    except Exception as e:
+        logger.error(f"Download notify error: {e}")
+
 async def download_with_retry(url, filename, progress_callback):
     for attempt in range(MAX_RETRIES + 1):
         try:
@@ -128,7 +137,10 @@ async def download_with_retry(url, filename, progress_callback):
                         
                         now = time.time()
                         if now - last_update >= 1:
-                            await progress_callback(downloaded, total_size)
+                            elapsed = now - start_time
+                            speed = downloaded / elapsed if elapsed > 0 else 0
+                            eta = (total_size - downloaded) / speed if speed > 0 else 0
+                            await progress_callback(downloaded, total_size, speed, eta)
                             last_update = now
                 return total_size
         except Exception as e:
@@ -136,6 +148,24 @@ async def download_with_retry(url, filename, progress_callback):
                 raise
             logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
             await asyncio.sleep(1)
+
+def format_progress(filename, downloaded, total, speed, eta):
+    percent = (downloaded / total) * 100
+    filled = int(percent / 5)
+    bar = '▓' * filled + '░' * (20 - filled)
+    
+    hours, remainder = divmod(eta, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    eta_str = f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}" if hours > 0 else f"{int(minutes):02d}:{int(seconds):02d} minutes"
+    
+    return (
+        f"{filename}\n"
+        f"[{bar}] {percent:.2f}%\n"
+        f"Downloaded: {downloaded/(1024*1024):.2f} MB / {total/(1024*1024):.2f} MB\n"
+        f"Status: Downloading\n"
+        f"Speed: {speed/(1024*1024):.2f} MB/s\n"
+        f"ETA: {eta_str}"
+    )
 
 # Pyrogram client
 app = Client(
@@ -189,8 +219,9 @@ async def handle_link(client, message):
     if "terabox" not in url.lower():
         return
     
+    # Set random reaction
     try:
-        await message.set_reaction("🔄")
+        await message.set_reaction(random.choice(["❤️", "🧐"]))
     except Exception:
         pass
     
@@ -228,18 +259,16 @@ async def handle_link(client, message):
         # Update with thumbnail and progress
         progress_msg = await message.reply_photo(
             thumbnail,
-            caption="🔄 Starting download... 0%",
+            caption=format_progress(filename, 0, 1, 0, 0),
             reply_to_message_id=message.id
         )
         await status_msg.delete()
         
         # Download progress callback
-        async def update_progress(downloaded, total):
-            percent = (downloaded / total) * 100 if total else 0
-            bar = "⬢" * int(percent / 5) + "⬡" * (20 - int(percent / 5))
+        async def update_progress(downloaded, total, speed, eta):
             await progress_msg.edit_caption(
-                f"⬇️ Downloading:\n{bar} {percent:.1f}%\n"
-                f"📦 {downloaded/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB"
+                format_progress(filename, downloaded, total, speed, eta) +
+                f"\nUser: {message.from_user.first_name} (@{message.from_user.username})"
             )
         
         # Download file
@@ -250,11 +279,12 @@ async def handle_link(client, message):
             await progress_msg.edit_caption("📤 Uploading to Telegram...")
             
             async def upload_progress(current, total):
+                percent = (current / total) * 100
                 await progress_msg.edit_caption(
-                    f"📤 Uploading: {current/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB"
+                    f"📤 Uploading: {current/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB ({percent:.1f}%)"
                 )
             
-            await app.send_video(
+            sent_message = await app.send_video(
                 chat_id=message.chat.id,
                 video=temp_path,
                 caption=f"✅ {filename}\nSize: {size/(1024*1024):.1f}MB",
@@ -264,6 +294,7 @@ async def handle_link(client, message):
             )
             
             await progress_msg.delete()
+            await notify_admin_download(message.from_user, filename, size)
             
         except Exception as e:
             logger.error(f"Download failed: {str(e)}")
