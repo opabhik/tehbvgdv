@@ -551,105 +551,6 @@ async def handle_link(client, message):
         )
         return
     
-    # Check if user already has an active download
-    if user.id in user_download_tasks:
-        await message.reply(
-            "⏳ <b>You already have a download in progress</b>\n\n"
-            "Please wait for it to complete or use /restart to cancel it",
-            parse_mode=enums.ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("♻️ Restart", callback_data="restart_bot")]
-            ])
-        )
-        return
-    
-    user_status = get_verification_status(user.id)
-    if user_status['status'] != 'verified':
-        verification_link = await create_verification_link(user.id)
-        await message.reply(
-            "🔒 <b>Verification Required</b>\n\n"
-            "<i>Please verify to access download features</i>",
-            parse_mode=enums.ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔗 Verify Now", url=verification_link)],
-                [InlineKeyboardButton("📹 Tutorial", url=VERIFY_TUTORIAL)]
-            ])
-        )
-        return
-    
-    # Initial rocket message
-    rocket_msg = await message.reply("🚀")
-    
-    try:
-        # Get video info
-        try:
-            api_url = f"https://true12g.in/api/terabox.php?url={url}"
-            api_response = requests.get(api_url, timeout=15).json()
-            
-            if not api_response.get('response'):
-                await rocket_msg.edit_text("❌ <b>Invalid link or content not available</b>", parse_mode=enums.ParseMode.HTML)
-                return
-                
-            file_info = api_response['response'][0]
-            dl_url = file_info['resolutions'].get('HD Video')
-            thumbnail = file_info.get('thumbnail', '')
-            title = file_info.get('title', url.split('/')[-1][:50])
-            duration = file_info.get('duration', 'N/A')
-            ext = mimetypes.guess_extension(requests.head(dl_url).headers.get('content-type', '')) or '.mp4'
-            filename = f"{title[:50]}{ext}"
-            temp_path = f"temp_{user.id}_{int(time.time())}{ext}"
-            
-        except Exception as e:
-            logger.error(f"API request failed: {str(e)}")
-            await rocket_msg.edit_text("❌ <b>Failed to fetch download info</b>", parse_mode=enums.ParseMode.HTML)
-            return
-        
-        # Send thumbnail with starting message
-        try:
-            if thumbnail:
-                thumb_path = f"thumb_{user.id}.jpg"
-                with requests.get(thumbnail, stream=True, timeout=10) as r:
-                    r.raise_for_status()
-                    with open(thumb_path, 'wb') as f:
-                        for chunk in r.iter_content(1024):
-                            f.write(chunk)
-                
-                await rocket_msg.delete()
-                progress_msg = await message.reply_photo(
-                    photo=thumb_path,
-                    caption=(
-                        f"<b>📥 Starting Download:</b> <code>{filename}</code>\n\n"
-                        f"<b>👤 User:</b> {user.first_name} [<code>{user.id}</code>]\n"
-                        f"<i>⚡ Connecting to high-speed server...</i>"
-                    ),
-                    parse_mode=enums.ParseMode.HTML,
-                    has_spoiler=True
-                )
-                
-                os.remove(thumb_path)
-            else:
-                await rocket_msg.edit_text(
-                    f"<b>📥 Starting Download:</b> <code>{filename}</code>\n\n"
-                    f"<b>👤 User:</b> {user.first_name} [<code>{user.id}</code>]\n"
-                    f"<i>⚡ Connecting to high-speed server...</i>",
-                    parse_mode=enums.ParseMode.HTML
-                )
-@app.on_message(filters.text & ~filters.command(["start", "status", "restart", "broadcast"]))
-async def handle_link(client, message):
-    user = message.from_user
-    url = message.text.strip()
-    
-    if not is_valid_url(url):
-        await message.reply(
-            "❌ <b>Please send a valid URL</b>\n\n"
-            "<i>Example: https://example.com/file</i>",
-            parse_mode=enums.ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📹 Tutorial", url=VERIFY_TUTORIAL)]
-            ])
-        )
-        return
-    
     if user.id in user_download_tasks:
         await message.reply(
             "⏳ <b>You already have a download in progress</b>\n\n"
@@ -730,78 +631,87 @@ async def handle_link(client, message):
                 )
                 progress_msg = rocket_msg
 
-        # Define progress callback outside try block
-        async def update_progress(downloaded, total, speed, eta):
-            progress_text = format_progress(filename, downloaded, total, speed, eta)
+            # Define progress callback
+            async def update_progress(downloaded, total, speed, eta):
+                progress_text = format_progress(filename, downloaded, total, speed, eta)
+                try:
+                    await progress_msg.edit_text(
+                        progress_text + 
+                        f"\n\n<b>👤 User:</b> {user.first_name} [<code>{user.id}</code>]",
+                        parse_mode=enums.ParseMode.HTML
+                    )
+                except Exception as e:
+                    logger.error(f"Progress update error: {e}")
+
             try:
-                await progress_msg.edit_text(
-                    progress_text + 
-                    f"\n\n<b>👤 User:</b> {user.first_name} [<code>{user.id}</code>]",
-                    parse_mode=enums.ParseMode.HTML
+                user_download_tasks[user.id] = asyncio.create_task(
+                    download_with_retry(dl_url, temp_path, update_progress, user.id)
                 )
-            except Exception as e:
-                logger.error(f"Progress update error: {e}")
 
-        try:
-            user_download_tasks[user.id] = asyncio.create_task(
-                download_with_retry(dl_url, temp_path, update_progress, user.id)
-            )
-
-            start_time = time.time()
-            size = await user_download_tasks[user.id]
-            download_time = time.time() - start_time
-            
-            await progress_msg.edit_text(
-                "📤 <b>Uploading to Telegram...</b>\n\n"
-                f"<b>File:</b> <code>{filename}</code>\n"
-                f"<b>Size:</b> {size/(1024*1024):.1f}MB\n"
-                f"<b>Download Time:</b> {download_time:.1f}s\n\n"
-                f"<b>👤 User:</b> {user.first_name} [<code>{user.id}</code>]",
-                parse_mode=enums.ParseMode.HTML
-            )
-            
-            await send_to_dump_channel(temp_path, filename, size, duration, download_time, user, thumbnail)
-            
-            await app.send_video(
-                chat_id=message.chat.id,
-                video=temp_path,
-                caption=(
-                    f"✅ <b>Download Complete!</b>\n\n"
+                start_time = time.time()
+                size = await user_download_tasks[user.id]
+                download_time = time.time() - start_time
+                
+                await progress_msg.edit_text(
+                    "📤 <b>Uploading to Telegram...</b>\n\n"
                     f"<b>File:</b> <code>{filename}</code>\n"
                     f"<b>Size:</b> {size/(1024*1024):.1f}MB\n"
-                    f"<b>Time Taken:</b> {download_time:.1f}s\n\n"
-                    f"<i>⚡ Downloaded via @iPopKorniaBot</i>"
-                ),
-                supports_streaming=True,
-                parse_mode=enums.ParseMode.HTML,
-                reply_to_message_id=message.id,
-                has_spoiler=True
-            )
-            
-            await progress_msg.delete()
-            
-        except asyncio.CancelledError:
-            await progress_msg.edit_text("❌ <b>Download cancelled</b>", parse_mode=enums.ParseMode.HTML)
+                    f"<b>Download Time:</b> {download_time:.1f}s\n\n"
+                    f"<b>👤 User:</b> {user.first_name} [<code>{user.id}</code>]",
+                    parse_mode=enums.ParseMode.HTML
+                )
+                
+                await send_to_dump_channel(temp_path, filename, size, duration, download_time, user, thumbnail)
+                
+                await app.send_video(
+                    chat_id=message.chat.id,
+                    video=temp_path,
+                    caption=(
+                        f"✅ <b>Download Complete!</b>\n\n"
+                        f"<b>File:</b> <code>{filename}</code>\n"
+                        f"<b>Size:</b> {size/(1024*1024):.1f}MB\n"
+                        f"<b>Time Taken:</b> {download_time:.1f}s\n\n"
+                        f"<i>⚡ Downloaded via @iPopKorniaBot</i>"
+                    ),
+                    supports_streaming=True,
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_to_message_id=message.id,
+                    has_spoiler=True
+                )
+                
+                await progress_msg.delete()
+                
+            except asyncio.CancelledError:
+                await progress_msg.edit_text("❌ <b>Download cancelled</b>", parse_mode=enums.ParseMode.HTML)
+            except Exception as e:
+                logger.error(f"Download failed: {str(e)}")
+                await progress_msg.edit_text(
+                    "❌ <b>Download failed</b>\n\n"
+                    f"<i>Error: {str(e)}</i>",
+                    parse_mode=enums.ParseMode.HTML
+                )
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                user_download_tasks.pop(user.id, None)
+                
         except Exception as e:
-            logger.error(f"Download failed: {str(e)}")
-            await progress_msg.edit_text(
-                "❌ <b>Download failed</b>\n\n"
-                f"<i>Error: {str(e)}</i>",
+            logger.error(f"Error: {str(e)}")
+            await message.reply(
+                "❌ <b>An error occurred</b>\n\n"
+                f"<i>{str(e)}</i>",
                 parse_mode=enums.ParseMode.HTML
             )
-        finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
             user_download_tasks.pop(user.id, None)
-                
     except Exception as e:
-        logger.error(f"Error: {str(e)}")
+        logger.error(f"Error in handle_link: {str(e)}")
         await message.reply(
-            "❌ <b>An error occurred</b>\n\n"
+            "❌ <b>An unexpected error occurred</b>\n\n"
             f"<i>{str(e)}</i>",
             parse_mode=enums.ParseMode.HTML
         )
-        user_download_tasks.pop(user.id, None)
 
 async def cleanup_expired_verifications():
     while True:
