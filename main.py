@@ -8,6 +8,7 @@ import requests
 import threading
 import secrets
 import random
+import re
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from pymongo import MongoClient
@@ -18,6 +19,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # Constants
 ADMIN_ID = 1562465522
+ADMIN_CHANNEL_ID = -1002512986775  # Your admin channel ID
 IST_OFFSET = timedelta(hours=5, minutes=30)
 GROUP_LINK = "https://t.me/+hK0K5vZhV3owMmM1"
 WELCOME_IMAGES = [
@@ -63,17 +65,76 @@ BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 MONGODB_URI = os.getenv("MONGODB_URI")
 LINK4EARN_API = os.getenv("LINK4EARN_API")
 
-# MongoDB
-mongo_client = MongoClient(MONGODB_URI)
-db = mongo_client.get_database("telegram_bot")
-downloads_collection = db.downloads
-verifications_collection = db.verifications
-users_collection = db.users
+# MongoDB Initialization with Error Handling
+def initialize_mongodb():
+    try:
+        mongo_client = MongoClient(MONGODB_URI)
+        db = mongo_client.get_database("telegram_bot")
+        
+        # Setup collections
+        downloads_collection = db.downloads
+        verifications_collection = db.verifications
+        users_collection = db.users
+        
+        # Setup indexes with duplicate handling
+        def setup_indexes():
+            try:
+                # Handle verifications collection
+                existing_indexes = verifications_collection.index_information()
+                
+                if 'user_id_1' not in existing_indexes:
+                    # Clean duplicates if they exist
+                    duplicates = list(verifications_collection.aggregate([
+                        {"$group": {
+                            "_id": "$user_id",
+                            "ids": {"$push": "$_id"},
+                            "count": {"$sum": 1}
+                        }},
+                        {"$match": {"count": {"$gt": 1}}}
+                    ]))
+                    
+                    for dup in duplicates:
+                        # Keep the most recent record
+                        most_recent = verifications_collection.find_one(
+                            {"user_id": dup["_id"]},
+                            sort=[("created_at", -1)]
+                        )
+                        if most_recent:
+                            # Delete others
+                            verifications_collection.delete_many({
+                                "user_id": dup["_id"],
+                                "_id": {"$ne": most_recent["_id"]}
+                            })
+                    
+                    # Now create the index
+                    verifications_collection.create_index([('user_id', 1)], unique=True)
+                    logger.info("Created unique index on user_id")
+                
+                # Create other indexes
+                verifications_collection.create_index([('token', 1)])
+                verifications_collection.create_index([('expires_at', 1)])
+                
+                # Indexes for other collections
+                users_collection.create_index([('user_id', 1)], unique=True)
+                downloads_collection.create_index([('user_id', 1)])
+                
+            except Exception as e:
+                logger.error(f"Error setting up indexes: {e}")
+                # Continue without indexes if there's an error
+        
+        setup_indexes()
+        return mongo_client, db, downloads_collection, verifications_collection, users_collection
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize MongoDB: {e}")
+        raise
 
-# Create indexes on startup
-verifications_collection.create_index([('user_id', 1)], unique=True)
-verifications_collection.create_index([('token', 1)])
-verifications_collection.create_index([('expires_at', 1)])
+try:
+    mongo_client, db, downloads_collection, verifications_collection, users_collection = initialize_mongodb()
+except Exception as e:
+    logger.error(f"Critical MongoDB initialization error: {e}")
+    # Exit if we can't connect to MongoDB
+    exit(1)
 
 # Helper functions
 def get_ist_time():
@@ -179,27 +240,29 @@ async def notify_admin_new_user(user):
     except Exception as e:
         logger.error(f"Admin notify error: {e}")
 
-async def notify_admin_download(user, filename, size, video_file_id):
+async def send_to_admin_channel(filename, size, duration, time_taken, user):
     try:
-        # Forward the video to admin
-        await app.forward_messages(
-            chat_id=ADMIN_ID,
-            from_chat_id=user.id,
-            message_ids=[video_file_id]
-        )
-        
-        # Send download info
-        await app.send_message(
-            ADMIN_ID,
+        # Upload file directly to admin channel with details in caption
+        caption = (
             f"<b>📥 New Download</b>\n\n"
             f"<b>File:</b> <code>{filename}</code>\n"
             f"<b>Size:</b> {size/(1024*1024):.1f}MB\n"
-            f"<b>User:</b> {user.first_name} (@{user.username})\n"
-            f"<b>ID:</b> <code>{user.id}</code>",
-            parse_mode=enums.ParseMode.HTML
+            f"<b>Duration:</b> {duration}\n"
+            f"<b>Time Taken:</b> {time_taken:.1f}s\n\n"
+            f"<b>User:</b> {user.first_name} [<code>{user.id}</code>]"
         )
+        
+        with open(filename, 'rb') as file:
+            await app.send_document(
+                chat_id=ADMIN_CHANNEL_ID,
+                document=file,
+                caption=caption,
+                parse_mode=enums.ParseMode.HTML,
+                disable_notification=True  # This prevents notifications for other admins
+            )
+            
     except Exception as e:
-        logger.error(f"Download notify error: {e}")
+        logger.error(f"Error sending to admin channel: {e}")
 
 async def broadcast_message(user_ids, message):
     success = 0
@@ -278,8 +341,16 @@ def format_progress(filename, downloaded, total, speed, eta):
         f"<i>🚀 Powered by @iPopKorniaBot</i>"
     )
 
-def is_terabox_link(text):
-    return any(domain in text for domain in ["terabox.com", "teraboxapp.com"])
+def is_valid_url(text):
+    # Check if text looks like a URL
+    url_pattern = re.compile(
+        r'^(?:http|ftp)s?://'  # http:// or https://
+        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|'  # domain...
+        r'localhost|'  # localhost...
+        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'  # ...or ip
+        r'(?::\d+)?'  # optional port
+        r'(?:/?|[/?]\S+)$', re.IGNORECASE)
+    return bool(url_pattern.match(text))
 
 # Pyrogram client
 app = Client(
@@ -317,7 +388,7 @@ async def start_handler(client, message):
                 random.choice(WELCOME_IMAGES),
                 caption=(
                     "<b>🚀 Welcome to iPopKornia Downloader Bot</b>\n\n"
-                    "📌 <i>Send me any TeraBox link to download</i>\n\n"
+                    "📌 <i>Send me any download link</i>\n\n"
                     "🔗 <i>Fastest downloads with premium speed</i>"
                 ),
                 parse_mode=enums.ParseMode.HTML,
@@ -331,7 +402,7 @@ async def start_handler(client, message):
         except Exception:
             await message.reply(
                 "<b>🚀 Welcome to iPopKornia Downloader Bot</b>\n\n"
-                "📌 <i>Send me any TeraBox link to download</i>",
+                "📌 <i>Send me any download link</i>",
                 parse_mode=enums.ParseMode.HTML
             )
 
@@ -340,7 +411,7 @@ async def status_handler(client, message):
     user = message.from_user
     status = get_verification_status(user.id)
     
-    response = f"<b>🔍 Verification Status for @{user.username}</b>\n\n"
+    response = f"<b>🔍 Verification Status</b>\n\n"
     
     if status['status'] == 'verified':
         response += (
@@ -355,7 +426,7 @@ async def status_handler(client, message):
             f"🔴 <b>Status:</b> {status['message']}\n"
             f"📅 <b>Was Verified On:</b> {format_ist_time(status['verified_at'])}\n"
             f"⌛ <b>Expired On:</b> {format_ist_time(status['expires_at'])}\n\n"
-            f"<i>Send any TeraBox link to get a new verification</i>"
+            f"<i>Send any link to get a new verification</i>"
         )
     elif status['status'] == 'pending':
         response += (
@@ -366,7 +437,7 @@ async def status_handler(client, message):
     else:
         response += (
             f"🔴 <b>Status:</b> {status['message']}\n\n"
-            f"<i>Send any TeraBox link to start verification</i>"
+            f"<i>Send any link to start verification</i>"
         )
     
     # Add buttons based on status
@@ -409,8 +480,7 @@ async def restart_handler(client, message):
         await app.send_message(
             ADMIN_ID,
             f"♻️ <b>Bot Restarted</b>\n\n"
-            f"<b>By:</b> {message.from_user.first_name} (@{message.from_user.username})\n"
-            f"<b>ID:</b> <code>{message.from_user.id}</code>\n"
+            f"<b>By:</b> {message.from_user.first_name} [<code>{message.from_user.id}</code>]\n"
             f"<b>Time:</b> {format_ist_time(get_ist_time())}",
             parse_mode=enums.ParseMode.HTML
         )
@@ -429,10 +499,10 @@ async def restart_handler(client, message):
 async def handle_link(client, message):
     url = message.text.strip()
     
-    if not is_terabox_link(url):
+    if not is_valid_url(url):
         await message.reply(
-            "❌ <b>Please send a valid TeraBox link</b>\n\n"
-            "<i>Example: https://www.terabox.com/...</i>",
+            "❌ <b>Please send a valid URL</b>\n\n"
+            "<i>Example: https://example.com/file</i>",
             parse_mode=enums.ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📹 Tutorial", url=VERIFY_TUTORIAL)]
@@ -456,8 +526,14 @@ async def handle_link(client, message):
         return
     
     try:
-        # Initial status message
-        status_msg = await message.reply("🔍 <b>Fetching download info...</b>", parse_mode=enums.ParseMode.HTML, reply_to_message_id=message.id)
+        # Immediately show download starting
+        filename = url.split('/')[-1][:50] or f"file_{int(time.time())}"
+        progress_msg = await message.reply(
+            f"<b>📥 Starting Download:</b> <code>{filename}</code>\n\n"
+            f"<b>👤 User:</b> {message.from_user.first_name} [<code>{message.from_user.id}</code>]\n"
+            f"<i>⚡ Connecting to high-speed server...</i>",
+            parse_mode=enums.ParseMode.HTML
+        )
         
         # Get video info
         api_url = f"https://true12g.in/api/terabox.php?url={url}"
@@ -465,89 +541,72 @@ async def handle_link(client, message):
             api_response = requests.get(api_url, timeout=15).json()
         except Exception as e:
             logger.error(f"API request failed: {str(e)}")
-            await status_msg.delete()
-            await message.reply("❌ <b>Failed to fetch download info</b>", parse_mode=enums.ParseMode.HTML)
+            await progress_msg.edit_text("❌ <b>Failed to fetch download info</b>", parse_mode=enums.ParseMode.HTML)
             return
             
         if not api_response.get('response'):
-            await status_msg.delete()
-            await message.reply("❌ <b>Invalid link or content not available</b>", parse_mode=enums.ParseMode.HTML)
+            await progress_msg.edit_text("❌ <b>Invalid link or content not available</b>", parse_mode=enums.ParseMode.HTML)
             return
             
         file_info = api_response['response'][0]
         dl_url = file_info['resolutions'].get('HD Video')
         thumbnail = file_info.get('thumbnail', '')
-        title = file_info.get('title', f"video_{int(time.time())}")
+        title = file_info.get('title', filename)
+        duration = file_info.get('duration', 'N/A')
         ext = mimetypes.guess_extension(requests.head(dl_url).headers.get('content-type', '')) or '.mp4'
         filename = f"{title[:50]}{ext}"
         temp_path = f"temp_{filename}"
         
-        # Update with thumbnail and progress - with spoiler
-        progress_msg = await message.reply_photo(
-            thumbnail,
-            caption=(
-                f"<b>📥 Preparing Download:</b> <code>{filename}</code>\n\n"
-                f"<i>⚡ Initializing high-speed connection...</i>\n\n"
-                f"<b>👤 User:</b> {message.from_user.first_name} (@{message.from_user.username})"
-            ),
-            parse_mode=enums.ParseMode.HTML,
-            has_spoiler=True,
-            reply_to_message_id=message.id
-        )
-        await status_msg.delete()
-        
-        # Download progress callback
+        # Update with progress
         async def update_progress(downloaded, total, speed, eta):
-            await progress_msg.edit_caption(
+            await progress_msg.edit_text(
                 format_progress(filename, downloaded, total, speed, eta) +
-                f"\n\n<b>👤 User:</b> {message.from_user.first_name} (@{message.from_user.username})",
+                f"\n\n<b>👤 User:</b> {message.from_user.first_name} [<code>{message.from_user.id}</code>]",
                 parse_mode=enums.ParseMode.HTML
             )
         
         # Download file
         try:
+            start_time = time.time()
             size = await download_with_retry(dl_url, temp_path, update_progress, message.from_user.id)
+            download_time = time.time() - start_time
             
             # Upload to Telegram
-            await progress_msg.edit_caption(
+            await progress_msg.edit_text(
                 "📤 <b>Uploading to Telegram...</b>\n\n"
-                "<i>⚡ Using premium bandwidth for fast upload</i>",
+                f"<b>File:</b> <code>{filename}</code>\n"
+                f"<b>Size:</b> {size/(1024*1024):.1f}MB\n"
+                f"<b>Download Time:</b> {download_time:.1f}s\n\n"
+                f"<b>👤 User:</b> {message.from_user.first_name} [<code>{message.from_user.id}</code>]",
                 parse_mode=enums.ParseMode.HTML
             )
             
-            async def upload_progress(current, total):
-                percent = (current / total) * 100
-                await progress_msg.edit_caption(
-                    f"📤 <b>Uploading:</b> <code>{filename}</code>\n\n"
-                    f"<b>Progress:</b> {current/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB ({percent:.1f}%)\n\n"
-                    f"<i>🚀 Powered by @iPopKorniaBot</i>",
-                    parse_mode=enums.ParseMode.HTML
-                )
+            # Send file directly to admin channel with details in caption
+            await send_to_admin_channel(temp_path, size, duration, download_time, message.from_user)
             
-            sent_message = await app.send_video(
+            # Send to user
+            await app.send_video(
                 chat_id=message.chat.id,
                 video=temp_path,
                 caption=(
                     f"✅ <b>Download Complete!</b>\n\n"
                     f"<b>File:</b> <code>{filename}</code>\n"
-                    f"<b>Size:</b> {size/(1024*1024):.1f}MB\n\n"
+                    f"<b>Size:</b> {size/(1024*1024):.1f}MB\n"
+                    f"<b>Time Taken:</b> {download_time:.1f}s\n\n"
                     f"<i>⚡ Downloaded via @iPopKorniaBot</i>"
                 ),
                 supports_streaming=True,
-                progress=upload_progress,
                 parse_mode=enums.ParseMode.HTML,
-                has_spoiler=True,
                 reply_to_message_id=message.id
             )
             
             await progress_msg.delete()
-            await notify_admin_download(message.from_user, filename, size, sent_message.id)
             
         except asyncio.CancelledError:
-            await progress_msg.edit_caption("❌ <b>Download cancelled</b>", parse_mode=enums.ParseMode.HTML)
+            await progress_msg.edit_text("❌ <b>Download cancelled</b>", parse_mode=enums.ParseMode.HTML)
         except Exception as e:
             logger.error(f"Download failed: {str(e)}")
-            await progress_msg.edit_caption(
+            await progress_msg.edit_text(
                 "❌ <b>Download failed</b>\n\n"
                 f"<i>Error: {str(e)}</i>",
                 parse_mode=enums.ParseMode.HTML
