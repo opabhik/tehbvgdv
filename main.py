@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from pymongo import MongoClient
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import BadRequest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # Constants
@@ -28,6 +29,8 @@ WELCOME_IMAGES = [
 DOWNLOAD_TIMEOUT = 45
 MAX_RETRIES = 2
 CHUNK_SIZE = 2 * 1024 * 1024  # 2MB chunks for upload
+VERIFY_TUTORIAL = "https://t.me/True12G_offical/96"
+DOWNLOAD_TUTORIAL = "https://t.me/Eagle_Looterz/3189"
 
 # Global variable to track active downloads
 active_downloads = {}
@@ -140,6 +143,19 @@ async def notify_admin_download(user, filename, size, video_file_id):
     except Exception as e:
         logger.error(f"Download notify error: {e}")
 
+async def broadcast_message(user_ids, message):
+    success = 0
+    failed = 0
+    for user_id in user_ids:
+        try:
+            await app.send_message(user_id, message)
+            success += 1
+            await asyncio.sleep(0.2)  # Rate limiting
+        except Exception as e:
+            logger.error(f"Failed to send to {user_id}: {str(e)}")
+            failed += 1
+    return success, failed
+
 async def download_with_retry(url, filename, progress_callback, user_id):
     active_downloads[user_id] = True
     try:
@@ -246,10 +262,9 @@ async def start_handler(client, message):
                 parse_mode=enums.ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
                     [
-                        InlineKeyboardButton("👨‍💻 Developer", url="https://t.me/Opabhik"),
-                        InlineKeyboardButton("💻 Source", url="https://t.me/True12G")
-                    ],
-                    [InlineKeyboardButton("👥 Join Group", url=GROUP_LINK)]
+                        InlineKeyboardButton("📹 Tutorial", url=DOWNLOAD_TUTORIAL),
+                        InlineKeyboardButton("👥 Join Group", url=GROUP_LINK)
+                    ]
                 ])
             )
         except Exception:
@@ -258,6 +273,50 @@ async def start_handler(client, message):
                 "📌 <i>Send me any TeraBox link to download</i>",
                 parse_mode=enums.ParseMode.HTML
             )
+
+@app.on_message(filters.command("status"))
+async def status_handler(client, message):
+    user = message.from_user
+    verification = verifications_collection.find_one({'user_id': user.id})
+    
+    if verification and verification.get('verified') and verification.get('expires_at', datetime.min) > get_ist_time():
+        status_text = "✅ <b>Verified</b>"
+        expiry_text = f"<b>Expires:</b> {format_ist_time(verification['expires_at'])}"
+    else:
+        status_text = "❌ <b>Not Verified</b>"
+        expiry_text = ""
+    
+    await message.reply(
+        f"<b>🔍 Your Verification Status</b>\n\n"
+        f"{status_text}\n"
+        f"{expiry_text}\n\n"
+        f"<i>To verify, send any TeraBox link</i>",
+        parse_mode=enums.ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📹 Verify Tutorial", url=VERIFY_TUTORIAL)]
+        ])
+    )
+
+@app.on_message(filters.command("broadcast") & filters.user(ADMIN_ID))
+async def broadcast_handler(client, message):
+    if len(message.command) < 2:
+        await message.reply("Usage: /broadcast <message>")
+        return
+    
+    broadcast_text = message.text.split(' ', 1)[1]
+    all_users = users_collection.find({}, {'user_id': 1})
+    user_ids = [user['user_id'] for user in all_users]
+    
+    processing_msg = await message.reply(f"📢 Broadcasting to {len(user_ids)} users...")
+    
+    success, failed = await broadcast_message(user_ids, broadcast_text)
+    
+    await processing_msg.edit_text(
+        f"📢 <b>Broadcast Completed</b>\n\n"
+        f"✅ Success: {success}\n"
+        f"❌ Failed: {failed}",
+        parse_mode=enums.ParseMode.HTML
+    )
 
 @app.on_message(filters.command("restart"))
 async def restart_handler(client, message):
@@ -282,15 +341,23 @@ async def restart_handler(client, message):
         logger.error(f"Restart error: {str(e)}")
         await message.reply("❌ <b>Error during restart</b>", parse_mode=enums.ParseMode.HTML)
 
-@app.on_message(filters.text & ~filters.command(["start", "status", "restart"]))
+def is_terabox_link(text):
+    return any(domain in text for domain in ["terabox.com", "teraboxapp.com"])
+
+@app.on_message(filters.text & ~filters.command(["start", "status", "restart", "broadcast"]))
 async def handle_link(client, message):
     url = message.text.strip()
     
-    # Set initial reaction
-    try:
-        await message.set_reaction("👀")
-    except Exception:
-        pass
+    if not is_terabox_link(url):
+        await message.reply(
+            "❌ <b>Please send a valid TeraBox link</b>\n\n"
+            "<i>Example: https://www.terabox.com/...</i>",
+            parse_mode=enums.ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📹 Tutorial", url=VERIFY_TUTORIAL)]
+            ])
+        )
+        return
     
     if not is_user_verified(message.from_user.id):
         verification_link = await create_verification_link(message.from_user.id)
@@ -299,7 +366,8 @@ async def handle_link(client, message):
             "<i>Please verify to access download features</i>",
             parse_mode=enums.ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔗 Verify Now", url=verification_link)]
+                [InlineKeyboardButton("🔗 Verify Now", url=verification_link)],
+                [InlineKeyboardButton("📹 Tutorial", url=VERIFY_TUTORIAL)]
             ]),
             reply_to_message_id=message.id
         )
@@ -316,12 +384,12 @@ async def handle_link(client, message):
         except Exception as e:
             logger.error(f"API request failed: {str(e)}")
             await status_msg.delete()
-            await message.set_reaction("🥲")
+            await message.reply("❌ <b>Failed to fetch download info</b>", parse_mode=enums.ParseMode.HTML)
             return
             
         if not api_response.get('response'):
             await status_msg.delete()
-            await message.set_reaction("🥲")
+            await message.reply("❌ <b>Invalid link or content not available</b>", parse_mode=enums.ParseMode.HTML)
             return
             
         file_info = api_response['response'][0]
@@ -332,13 +400,7 @@ async def handle_link(client, message):
         filename = f"{title[:50]}{ext}"
         temp_path = f"temp_{filename}"
         
-        # Update reaction to show processing
-        try:
-            await message.set_reaction("⏳")
-        except Exception:
-            pass
-        
-        # Update with thumbnail and progress
+        # Update with thumbnail and progress - with spoiler
         progress_msg = await message.reply_photo(
             thumbnail,
             caption=(
@@ -363,12 +425,6 @@ async def handle_link(client, message):
         # Download file
         try:
             size = await download_with_retry(dl_url, temp_path, update_progress, message.from_user.id)
-            
-            # Update reaction to show uploading
-            try:
-                await message.set_reaction("📤")
-            except Exception:
-                pass
             
             # Upload to Telegram
             await progress_msg.edit_caption(
@@ -402,21 +458,11 @@ async def handle_link(client, message):
                 reply_to_message_id=message.id
             )
             
-            # Update reaction to show success
-            try:
-                await message.set_reaction("✅")
-            except Exception:
-                pass
-            
             await progress_msg.delete()
             await notify_admin_download(message.from_user, filename, size, sent_message.id)
             
         except asyncio.CancelledError:
             await progress_msg.edit_caption("❌ <b>Download cancelled</b>", parse_mode=enums.ParseMode.HTML)
-            try:
-                await message.set_reaction("❌")
-            except Exception:
-                pass
         except Exception as e:
             logger.error(f"Download failed: {str(e)}")
             await progress_msg.edit_caption(
@@ -424,28 +470,17 @@ async def handle_link(client, message):
                 f"<i>Error: {str(e)}</i>",
                 parse_mode=enums.ParseMode.HTML
             )
-            try:
-                await message.set_reaction("🥲")
-            except Exception:
-                pass
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
                 
     except Exception as e:
         logger.error(f"Error: {str(e)}")
-        try:
-            await message.set_reaction("🥲")
-        except Exception:
-            pass
-        try:
-            await message.reply(
-                "❌ <b>An error occurred</b>\n\n"
-                f"<i>{str(e)}</i>",
-                parse_mode=enums.ParseMode.HTML
-            )
-        except Exception:
-            pass
+        await message.reply(
+            "❌ <b>An error occurred</b>\n\n"
+            f"<i>{str(e)}</i>",
+            parse_mode=enums.ParseMode.HTML
+        )
 
 async def main():
     # Notify admin about bot starting
