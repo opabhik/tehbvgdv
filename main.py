@@ -70,21 +70,49 @@ downloads_collection = db.downloads
 verifications_collection = db.verifications
 users_collection = db.users
 
+# Create indexes on startup
+verifications_collection.create_index([('user_id', 1)], unique=True)
+verifications_collection.create_index([('token', 1)])
+verifications_collection.create_index([('expires_at', 1)])
+
 # Helper functions
 def get_ist_time():
     return datetime.utcnow() + IST_OFFSET
 
 def format_ist_time(dt):
-    return dt.strftime('%d-%m-%Y %I:%M %p') if dt else "N/A"
+    return dt.strftime('%d %b %Y, %I:%M %p') if dt else "N/A"
+
+def format_timedelta(td):
+    if not td:
+        return "0 seconds"
+    
+    days = td.days
+    hours, remainder = divmod(td.seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    
+    parts = []
+    if days > 0:
+        parts.append(f"{days} day{'s' if days != 1 else ''}")
+    if hours > 0:
+        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+    if minutes > 0:
+        parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+    if seconds > 0 or not parts:
+        parts.append(f"{seconds} second{'s' if seconds != 1 else ''}")
+    
+    return ", ".join(parts)
 
 async def create_verification_link(user_id):
+    # Delete any existing verification records for this user
+    verifications_collection.delete_many({'user_id': user_id})
+    
     token = secrets.token_urlsafe(12)
-    expires_at = get_ist_time() + timedelta(hours=8)
+    expires_at = datetime.utcnow() + timedelta(hours=8)
     
     verifications_collection.insert_one({
         'user_id': user_id,
         'token': token,
-        'created_at': get_ist_time(),
+        'created_at': datetime.utcnow(),
         'expires_at': expires_at,
         'verified': False,
         'used': False
@@ -101,12 +129,42 @@ async def shorten_url(url):
     except Exception:
         return url
 
-def is_user_verified(user_id):
-    return verifications_collection.find_one({
-        'user_id': user_id,
-        'verified': True,
-        'expires_at': {'$gt': get_ist_time()}
-    })
+def get_verification_status(user_id):
+    verification = verifications_collection.find_one({'user_id': user_id})
+    
+    if not verification:
+        return {
+            'status': 'not_verified',
+            'message': "You haven't started verification yet"
+        }
+    
+    if verification.get('verified') and verification.get('expires_at', datetime.min) > datetime.utcnow():
+        remaining_time = verification['expires_at'] - datetime.utcnow()
+        return {
+            'status': 'verified',
+            'message': "✅ Your account is verified",
+            'verified_at': verification.get('created_at'),
+            'expires_at': verification['expires_at'],
+            'remaining_time': remaining_time
+        }
+    elif verification.get('verified') and verification.get('expires_at', datetime.min) <= datetime.utcnow():
+        return {
+            'status': 'expired',
+            'message': "❌ Your verification has expired",
+            'verified_at': verification.get('created_at'),
+            'expires_at': verification['expires_at']
+        }
+    elif not verification.get('verified') and verification.get('token'):
+        return {
+            'status': 'pending',
+            'message': "⏳ Verification link sent but not completed",
+            'created_at': verification.get('created_at')
+        }
+    else:
+        return {
+            'status': 'invalid',
+            'message': "❌ Invalid verification status"
+        }
 
 async def notify_admin_new_user(user):
     try:
@@ -220,6 +278,9 @@ def format_progress(filename, downloaded, total, speed, eta):
         f"<i>🚀 Powered by @iPopKorniaBot</i>"
     )
 
+def is_terabox_link(text):
+    return any(domain in text for domain in ["terabox.com", "teraboxapp.com"])
+
 # Pyrogram client
 app = Client(
     "koyeb_bot",
@@ -246,7 +307,7 @@ async def start_handler(client, message):
     if len(message.command) > 1 and message.command[1].startswith('verify-'):
         token = message.command[1][7:]
         verification = verifications_collection.find_one_and_update(
-            {'token': token, 'used': False, 'expires_at': {'$gt': get_ist_time()}},
+            {'token': token, 'used': False, 'expires_at': {'$gt': datetime.utcnow()}},
             {'$set': {'verified': True, 'used': True}}
         )
         await message.reply("✅ <b>Verified successfully!</b>", parse_mode=enums.ParseMode.HTML)
@@ -277,24 +338,47 @@ async def start_handler(client, message):
 @app.on_message(filters.command("status"))
 async def status_handler(client, message):
     user = message.from_user
-    verification = verifications_collection.find_one({'user_id': user.id})
+    status = get_verification_status(user.id)
     
-    if verification and verification.get('verified') and verification.get('expires_at', datetime.min) > get_ist_time():
-        status_text = "✅ <b>Verified</b>"
-        expiry_text = f"<b>Expires:</b> {format_ist_time(verification['expires_at'])}"
+    response = f"<b>🔍 Verification Status for @{user.username}</b>\n\n"
+    
+    if status['status'] == 'verified':
+        response += (
+            f"🟢 <b>Status:</b> {status['message']}\n"
+            f"📅 <b>Verified On:</b> {format_ist_time(status['verified_at'])}\n"
+            f"⏳ <b>Time Remaining:</b> {format_timedelta(status['remaining_time'])}\n"
+            f"⌛ <b>Expires On:</b> {format_ist_time(status['expires_at'])}\n\n"
+            f"<i>To renew verification, simply verify again after expiration</i>"
+        )
+    elif status['status'] == 'expired':
+        response += (
+            f"🔴 <b>Status:</b> {status['message']}\n"
+            f"📅 <b>Was Verified On:</b> {format_ist_time(status['verified_at'])}\n"
+            f"⌛ <b>Expired On:</b> {format_ist_time(status['expires_at'])}\n\n"
+            f"<i>Send any TeraBox link to get a new verification</i>"
+        )
+    elif status['status'] == 'pending':
+        response += (
+            f"🟡 <b>Status:</b> {status['message']}\n"
+            f"📅 <b>Link Sent On:</b> {format_ist_time(status['created_at'])}\n\n"
+            f"<i>Complete verification by clicking the link sent to you</i>"
+        )
     else:
-        status_text = "❌ <b>Not Verified</b>"
-        expiry_text = ""
+        response += (
+            f"🔴 <b>Status:</b> {status['message']}\n\n"
+            f"<i>Send any TeraBox link to start verification</i>"
+        )
+    
+    # Add buttons based on status
+    buttons = []
+    if status['status'] != 'verified':
+        buttons.append([InlineKeyboardButton("📹 Verify Tutorial", url=VERIFY_TUTORIAL)])
+    buttons.append([InlineKeyboardButton("👥 Join Group", url=GROUP_LINK)])
     
     await message.reply(
-        f"<b>🔍 Your Verification Status</b>\n\n"
-        f"{status_text}\n"
-        f"{expiry_text}\n\n"
-        f"<i>To verify, send any TeraBox link</i>",
+        response,
         parse_mode=enums.ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📹 Verify Tutorial", url=VERIFY_TUTORIAL)]
-        ])
+        reply_markup=InlineKeyboardMarkup(buttons)
     )
 
 @app.on_message(filters.command("broadcast") & filters.user(ADMIN_ID))
@@ -341,9 +425,6 @@ async def restart_handler(client, message):
         logger.error(f"Restart error: {str(e)}")
         await message.reply("❌ <b>Error during restart</b>", parse_mode=enums.ParseMode.HTML)
 
-def is_terabox_link(text):
-    return any(domain in text for domain in ["terabox.com", "teraboxapp.com"])
-
 @app.on_message(filters.text & ~filters.command(["start", "status", "restart", "broadcast"]))
 async def handle_link(client, message):
     url = message.text.strip()
@@ -359,7 +440,8 @@ async def handle_link(client, message):
         )
         return
     
-    if not is_user_verified(message.from_user.id):
+    user_status = get_verification_status(message.from_user.id)
+    if user_status['status'] != 'verified':
         verification_link = await create_verification_link(message.from_user.id)
         await message.reply(
             "🔒 <b>Verification Required</b>\n\n"
@@ -482,7 +564,22 @@ async def handle_link(client, message):
             parse_mode=enums.ParseMode.HTML
         )
 
+async def cleanup_expired_verifications():
+    while True:
+        try:
+            result = verifications_collection.delete_many({
+                'expires_at': {'$lt': datetime.utcnow()}
+            })
+            logger.info(f"Cleaned up {result.deleted_count} expired verifications")
+        except Exception as e:
+            logger.error(f"Cleanup error: {e}")
+        
+        await asyncio.sleep(3600)  # Run every hour
+
 async def main():
+    # Start cleanup task
+    asyncio.create_task(cleanup_expired_verifications())
+    
     # Notify admin about bot starting
     try:
         await app.start()
