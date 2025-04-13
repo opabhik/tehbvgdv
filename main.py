@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from pymongo import MongoClient
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import BadRequest
+from pyrogram.errors import BadRequest, FloodWait
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # Constants
@@ -30,12 +30,14 @@ WELCOME_IMAGES = [
 ]
 DOWNLOAD_TIMEOUT = 45
 MAX_RETRIES = 2
-CHUNK_SIZE = 2 * 1024 * 1024  # 2MB chunks for upload
+CHUNK_SIZE = 4 * 1024 * 1024  # 4MB chunks for faster download
 VERIFY_TUTORIAL = "https://t.me/True12G_offical/96"
 DOWNLOAD_TUTORIAL = "https://t.me/Eagle_Looterz/3189"
 
-# Global variable to track active downloads
+# Global variables
 active_downloads = {}
+user_download_tasks = {}
+broadcast_posts = {}
 
 # Dummy HTTP healthcheck server
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -65,64 +67,22 @@ BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 MONGODB_URI = os.getenv("MONGODB_URI")
 LINK4EARN_API = os.getenv("LINK4EARN_API")
 
-# MongoDB Initialization with Error Handling
+# MongoDB Initialization
 def initialize_mongodb():
     try:
         mongo_client = MongoClient(MONGODB_URI)
         db = mongo_client.get_database("telegram_bot")
-        
-        # Setup collections
-        downloads_collection = db.downloads
-        verifications_collection = db.verifications
         users_collection = db.users
+        verifications_collection = db.verifications
+        downloads_collection = db.downloads
         
-        # Setup indexes with duplicate handling
-        def setup_indexes():
-            try:
-                # Handle verifications collection
-                existing_indexes = verifications_collection.index_information()
-                
-                if 'user_id_1' not in existing_indexes:
-                    # Clean duplicates if they exist
-                    duplicates = list(verifications_collection.aggregate([
-                        {"$group": {
-                            "_id": "$user_id",
-                            "ids": {"$push": "$_id"},
-                            "count": {"$sum": 1}
-                        }},
-                        {"$match": {"count": {"$gt": 1}}}
-                    ]))
-                    
-                    for dup in duplicates:
-                        # Keep the most recent record
-                        most_recent = verifications_collection.find_one(
-                            {"user_id": dup["_id"]},
-                            sort=[("created_at", -1)]
-                        )
-                        if most_recent:
-                            # Delete others
-                            verifications_collection.delete_many({
-                                "user_id": dup["_id"],
-                                "_id": {"$ne": most_recent["_id"]}
-                            })
-                    
-                    # Now create the index
-                    verifications_collection.create_index([('user_id', 1)], unique=True)
-                    logger.info("Created unique index on user_id")
-                
-                # Create other indexes
-                verifications_collection.create_index([('token', 1)])
-                verifications_collection.create_index([('expires_at', 1)])
-                
-                # Indexes for other collections
-                users_collection.create_index([('user_id', 1)], unique=True)
-                downloads_collection.create_index([('user_id', 1)])
-                
-            except Exception as e:
-                logger.error(f"Error setting up indexes: {e}")
-                # Continue without indexes if there's an error
+        # Create indexes
+        users_collection.create_index([('user_id', 1)], unique=True)
+        verifications_collection.create_index([('user_id', 1)], unique=True)
+        verifications_collection.create_index([('token', 1)])
+        verifications_collection.create_index([('expires_at', 1)], expireAfterSeconds=0)
+        downloads_collection.create_index([('user_id', 1)])
         
-        setup_indexes()
         return mongo_client, db, downloads_collection, verifications_collection, users_collection
         
     except Exception as e:
@@ -133,7 +93,6 @@ try:
     mongo_client, db, downloads_collection, verifications_collection, users_collection = initialize_mongodb()
 except Exception as e:
     logger.error(f"Critical MongoDB initialization error: {e}")
-    # Exit if we can't connect to MongoDB
     exit(1)
 
 # Helper functions
@@ -164,7 +123,6 @@ def format_timedelta(td):
     return ", ".join(parts)
 
 async def create_verification_link(user_id):
-    # Delete any existing verification records for this user
     verifications_collection.delete_many({'user_id': user_id})
     
     token = secrets.token_urlsafe(12)
@@ -194,10 +152,7 @@ def get_verification_status(user_id):
     verification = verifications_collection.find_one({'user_id': user_id})
     
     if not verification:
-        return {
-            'status': 'not_verified',
-            'message': "You haven't started verification yet"
-        }
+        return {'status': 'not_verified', 'message': "You haven't started verification yet"}
     
     if verification.get('verified') and verification.get('expires_at', datetime.min) > datetime.utcnow():
         remaining_time = verification['expires_at'] - datetime.utcnow()
@@ -222,10 +177,7 @@ def get_verification_status(user_id):
             'created_at': verification.get('created_at')
         }
     else:
-        return {
-            'status': 'invalid',
-            'message': "❌ Invalid verification status"
-        }
+        return {'status': 'invalid', 'message': "❌ Invalid verification status"}
 
 async def notify_admin_new_user(user):
     try:
@@ -242,7 +194,6 @@ async def notify_admin_new_user(user):
 
 async def send_to_dump_channel(file_path, filename, size, duration, time_taken, user, thumbnail_url=None):
     try:
-        # Download thumbnail if available
         thumbnail_path = None
         if thumbnail_url:
             try:
@@ -256,7 +207,6 @@ async def send_to_dump_channel(file_path, filename, size, duration, time_taken, 
                 logger.error(f"Error downloading thumbnail: {e}")
                 thumbnail_path = None
         
-        # Prepare caption with spoiler
         caption = (
             f"<b>📥 Download Details (Spoiler)</b>\n"
             f"<tg-spoiler>\n"
@@ -268,15 +218,14 @@ async def send_to_dump_channel(file_path, filename, size, duration, time_taken, 
             f"</tg-spoiler>"
         )
         
-        # Send file to dump channel
         with open(file_path, 'rb') as file:
-            if file_path.endswith('.mp4') or file_path.endswith('.mkv'):
+            if file_path.endswith(('.mp4', '.mkv', '.mov')):
                 await app.send_video(
                     chat_id=ADMIN_CHANNEL_ID,
                     video=file,
                     caption=caption,
                     parse_mode=enums.ParseMode.HTML,
-                    thumb=thumbnail_path if thumbnail_path else None,
+                    thumb=thumbnail_path,
                     supports_streaming=True,
                     disable_notification=True
                 )
@@ -286,29 +235,15 @@ async def send_to_dump_channel(file_path, filename, size, duration, time_taken, 
                     document=file,
                     caption=caption,
                     parse_mode=enums.ParseMode.HTML,
-                    thumb=thumbnail_path if thumbnail_path else None,
+                    thumb=thumbnail_path,
                     disable_notification=True
                 )
         
-        # Clean up thumbnail
         if thumbnail_path and os.path.exists(thumbnail_path):
             os.remove(thumbnail_path)
             
     except Exception as e:
         logger.error(f"Error sending to dump channel: {e}")
-
-async def broadcast_message(user_ids, message):
-    success = 0
-    failed = 0
-    for user_id in user_ids:
-        try:
-            await app.send_message(user_id, message)
-            success += 1
-            await asyncio.sleep(0.2)  # Rate limiting
-        except Exception as e:
-            logger.error(f"Failed to send to {user_id}: {str(e)}")
-            failed += 1
-    return success, failed
 
 async def download_with_retry(url, filename, progress_callback, user_id):
     active_downloads[user_id] = True
@@ -331,7 +266,7 @@ async def download_with_retry(url, filename, progress_callback, user_id):
                             downloaded += len(chunk)
                             
                             now = time.time()
-                            if now - last_update >= 1:  # Update every 1 second
+                            if now - last_update >= 2:  # Update every 2 seconds
                                 elapsed = now - start_time
                                 speed = downloaded / elapsed if elapsed > 0 else 0
                                 eta = (total_size - downloaded) / speed if speed > 0 else 0
@@ -345,44 +280,26 @@ async def download_with_retry(url, filename, progress_callback, user_id):
                 await asyncio.sleep(1)
     finally:
         active_downloads.pop(user_id, None)
+        user_download_tasks.pop(user_id, None)
 
 def format_progress(filename, downloaded, total, speed, eta):
     percent = (downloaded / total) * 100
-    filled = int(percent / 5)
-    progress_bar = '▰' * filled + '▱' * (20 - filled)
+    filled = int(percent / 10)
+    progress_bar = '▓' * filled + '░' * (10 - filled)
     
-    # Format speed
-    if speed > 1024*1024:
-        speed_str = f"{speed/(1024*1024):.2f} MB/s"
-    elif speed > 1024:
-        speed_str = f"{speed/1024:.2f} KB/s"
-    else:
-        speed_str = f"{speed:.2f} B/s"
+    speed_str = f"{speed/(1024*1024):.2f} MB/s" if speed > 1024*1024 else f"{speed/1024:.2f} KB/s"
+    eta_str = f"{int(eta//3600)}h {int((eta%3600)//60)}m" if eta > 3600 else f"{int(eta//60)}m {int(eta%60)}s" if eta > 60 else f"{int(eta)}s"
     
-    # Format ETA
-    if eta > 3600:
-        eta_str = f"{int(eta//3600)}h {int((eta%3600)//60)}m"
-    elif eta > 60:
-        eta_str = f"{int(eta//60)}m {int(eta%60)}s"
-    else:
-        eta_str = f"{int(eta)}s"
-    
-    # Format size
-    size_str = f"{downloaded/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB"
-    
-    progress_text = (
+    return (
         f"<b>📥 Downloading:</b> <code>{filename}</code>\n\n"
-        f"<b>Progress:</b> {progress_bar} {percent:.1f}%\n"
-        f"<b>Size:</b> {size_str}\n"
+        f"<b>Progress:</b> [{progress_bar}] {percent:.2f}%\n"
+        f"<b>Size:</b> {downloaded/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB\n"
         f"<b>Speed:</b> {speed_str}\n"
         f"<b>ETA:</b> {eta_str}\n\n"
         f"<i>🚀 Powered by @iPopKorniaBot</i>"
     )
-    
-    return progress_text
 
 def is_valid_url(text):
-    # Check if text looks like a URL
     url_pattern = re.compile(
         r'^(?:http|ftp)s?://'  # http:// or https://
         r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|'  # domain...
@@ -436,6 +353,9 @@ async def start_handler(client, message):
                     [
                         InlineKeyboardButton("📹 Tutorial", url=DOWNLOAD_TUTORIAL),
                         InlineKeyboardButton("👥 Join Group", url=GROUP_LINK)
+                    ],
+                    [
+                        InlineKeyboardButton("♻️ Restart", callback_data="restart_bot")
                     ]
                 ])
             )
@@ -445,6 +365,16 @@ async def start_handler(client, message):
                 "📌 <i>Send me any download link</i>",
                 parse_mode=enums.ParseMode.HTML
             )
+
+@app.on_callback_query(filters.regex("^restart_bot$"))
+async def restart_callback(client, callback_query):
+    user_id = callback_query.from_user.id
+    if user_id in active_downloads:
+        active_downloads[user_id] = False
+        await callback_query.answer("All active downloads cancelled. Please try again.")
+    else:
+        await callback_query.answer("No active downloads to cancel.")
+    await callback_query.message.delete()
 
 @app.on_message(filters.command("status"))
 async def status_handler(client, message):
@@ -480,11 +410,11 @@ async def status_handler(client, message):
             f"<i>Send any link to start verification</i>"
         )
     
-    # Add buttons based on status
     buttons = []
     if status['status'] != 'verified':
         buttons.append([InlineKeyboardButton("📹 Verify Tutorial", url=VERIFY_TUTORIAL)])
     buttons.append([InlineKeyboardButton("👥 Join Group", url=GROUP_LINK)])
+    buttons.append([InlineKeyboardButton("♻�� Restart", callback_data="restart_bot")])
     
     await message.reply(
         response,
@@ -495,16 +425,62 @@ async def status_handler(client, message):
 @app.on_message(filters.command("broadcast") & filters.user(ADMIN_ID))
 async def broadcast_handler(client, message):
     if len(message.command) < 2:
-        await message.reply("Usage: /broadcast <message>")
+        await message.reply(
+            "Please reply to a message with /broadcast to send it to all users\n"
+            "Or use /broadcast <message> to send a text message",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Cancel", callback_data="cancel_broadcast")]
+            ])
+        )
         return
     
-    broadcast_text = message.text.split(' ', 1)[1]
+    if message.reply_to_message:
+        broadcast_posts[message.from_user.id] = message.reply_to_message
+        await message.reply(
+            "You've selected a message to broadcast. Confirm?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes", callback_data="confirm_broadcast")],
+                [InlineKeyboardButton("❌ No", callback_data="cancel_broadcast")]
+            ])
+        )
+    else:
+        broadcast_text = message.text.split(' ', 1)[1]
+        broadcast_posts[message.from_user.id] = broadcast_text
+        await message.reply(
+            f"Broadcast this message to all users?\n\n{broadcast_text}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes", callback_data="confirm_broadcast")],
+                [InlineKeyboardButton("❌ No", callback_data="cancel_broadcast")]
+            ])
+        )
+
+@app.on_callback_query(filters.regex("^confirm_broadcast$"))
+async def confirm_broadcast(client, callback_query):
+    user_id = callback_query.from_user.id
+    if user_id not in broadcast_posts:
+        await callback_query.answer("No broadcast message found!")
+        return
+    
+    broadcast_content = broadcast_posts.pop(user_id)
     all_users = users_collection.find({}, {'user_id': 1})
     user_ids = [user['user_id'] for user in all_users]
     
-    processing_msg = await message.reply(f"📢 Broadcasting to {len(user_ids)} users...")
+    processing_msg = await callback_query.message.edit_text(f"📢 Broadcasting to {len(user_ids)} users...")
     
-    success, failed = await broadcast_message(user_ids, broadcast_text)
+    success = 0
+    failed = 0
+    
+    for user_id in user_ids:
+        try:
+            if isinstance(broadcast_content, str):
+                await app.send_message(user_id, broadcast_content)
+            else:
+                await broadcast_content.copy(user_id)
+            success += 1
+            await asyncio.sleep(0.1)  # Rate limiting
+        except Exception as e:
+            logger.error(f"Failed to send to {user_id}: {str(e)}")
+            failed += 1
     
     await processing_msg.edit_text(
         f"📢 <b>Broadcast Completed</b>\n\n"
@@ -512,31 +488,37 @@ async def broadcast_handler(client, message):
         f"❌ Failed: {failed}",
         parse_mode=enums.ParseMode.HTML
     )
+    await callback_query.answer()
+
+@app.on_callback_query(filters.regex("^cancel_broadcast$"))
+async def cancel_broadcast(client, callback_query):
+    user_id = callback_query.from_user.id
+    if user_id in broadcast_posts:
+        broadcast_posts.pop(user_id)
+    await callback_query.message.delete()
+    await callback_query.answer("Broadcast cancelled")
 
 @app.on_message(filters.command("restart"))
 async def restart_handler(client, message):
-    try:
-        # Notify admin about restart
-        await app.send_message(
-            ADMIN_ID,
-            f"♻️ <b>Bot Restarted</b>\n\n"
-            f"<b>By:</b> {message.from_user.first_name} [<code>{message.from_user.id}</code>]\n"
-            f"<b>Time:</b> {format_ist_time(get_ist_time())}",
+    user_id = message.from_user.id
+    if user_id in active_downloads:
+        active_downloads[user_id] = False
+        await message.reply(
+            "♻️ <b>Restarting...</b>\n\n"
+            "⚠️ <i>All active downloads cancelled</i>\n"
+            "Please try your download again",
             parse_mode=enums.ParseMode.HTML
         )
-        
-        # Cancel all active downloads for this user
-        if message.from_user.id in active_downloads:
-            active_downloads[message.from_user.id] = False
-            await message.reply("♻️ <b>Restarting...</b>\n\n⚠️ <i>Active downloads cancelled</i>", parse_mode=enums.ParseMode.HTML)
-        else:
-            await message.reply("♻️ <b>Bot restarted successfully!</b>", parse_mode=enums.ParseMode.HTML)
-    except Exception as e:
-        logger.error(f"Restart error: {str(e)}")
-        await message.reply("❌ <b>Error during restart</b>", parse_mode=enums.ParseMode.HTML)
+    else:
+        await message.reply(
+            "♻️ <b>No active downloads to cancel</b>\n\n"
+            "You can start new downloads now",
+            parse_mode=enums.ParseMode.HTML
+        )
 
 @app.on_message(filters.text & ~filters.command(["start", "status", "restart", "broadcast"]))
 async def handle_link(client, message):
+    user = message.from_user
     url = message.text.strip()
     
     if not is_valid_url(url):
@@ -550,13 +532,22 @@ async def handle_link(client, message):
         )
         return
     
-    # Initial rocket message
-    rocket_msg = await message.reply("🚀")
+    # Check if user already has an active download
+    if user.id in user_download_tasks:
+        await message.reply(
+            "⏳ <b>You already have a download in progress</b>\n\n"
+            "Please wait for it to complete or use /restart to cancel it",
+            parse_mode=enums.ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("♻️ Restart", callback_data="restart_bot")]
+            ])
+        )
+        return
     
-    user_status = get_verification_status(message.from_user.id)
+    user_status = get_verification_status(user.id)
     if user_status['status'] != 'verified':
-        verification_link = await create_verification_link(message.from_user.id)
-        await rocket_msg.edit_text(
+        verification_link = await create_verification_link(user.id)
+        await message.reply(
             "🔒 <b>Verification Required</b>\n\n"
             "<i>Please verify to access download features</i>",
             parse_mode=enums.ParseMode.HTML,
@@ -567,58 +558,60 @@ async def handle_link(client, message):
         )
         return
     
+    # Initial rocket message
+    rocket_msg = await message.reply("🚀")
+    
     try:
         # Get video info
-        api_url = f"https://true12g.in/api/terabox.php?url={url}"
         try:
+            api_url = f"https://true12g.in/api/terabox.php?url={url}"
             api_response = requests.get(api_url, timeout=15).json()
+            
+            if not api_response.get('response'):
+                await rocket_msg.edit_text("❌ <b>Invalid link or content not available</b>", parse_mode=enums.ParseMode.HTML)
+                return
+                
+            file_info = api_response['response'][0]
+            dl_url = file_info['resolutions'].get('HD Video')
+            thumbnail = file_info.get('thumbnail', '')
+            title = file_info.get('title', url.split('/')[-1][:50])
+            duration = file_info.get('duration', 'N/A')
+            ext = mimetypes.guess_extension(requests.head(dl_url).headers.get('content-type', '')) or '.mp4'
+            filename = f"{title[:50]}{ext}"
+            temp_path = f"temp_{user.id}_{int(time.time())}{ext}"
+            
         except Exception as e:
             logger.error(f"API request failed: {str(e)}")
             await rocket_msg.edit_text("❌ <b>Failed to fetch download info</b>", parse_mode=enums.ParseMode.HTML)
             return
-            
-        if not api_response.get('response'):
-            await rocket_msg.edit_text("❌ <b>Invalid link or content not available</b>", parse_mode=enums.ParseMode.HTML)
-            return
-            
-        file_info = api_response['response'][0]
-        dl_url = file_info['resolutions'].get('HD Video')
-        thumbnail = file_info.get('thumbnail', '')
-        title = file_info.get('title', url.split('/')[-1][:50])
-        duration = file_info.get('duration', 'N/A')
-        ext = mimetypes.guess_extension(requests.head(dl_url).headers.get('content-type', '')) or '.mp4'
-        filename = f"{title[:50]}{ext}"
-        temp_path = f"temp_{filename}"
         
         # Send thumbnail with starting message
         try:
             if thumbnail:
-                # Download thumbnail
-                thumb_path = f"thumb_{message.from_user.id}.jpg"
+                thumb_path = f"thumb_{user.id}.jpg"
                 with requests.get(thumbnail, stream=True, timeout=10) as r:
                     r.raise_for_status()
                     with open(thumb_path, 'wb') as f:
                         for chunk in r.iter_content(1024):
                             f.write(chunk)
                 
-                # Edit rocket message with thumbnail
                 await rocket_msg.delete()
                 progress_msg = await message.reply_photo(
                     photo=thumb_path,
                     caption=(
                         f"<b>📥 Starting Download:</b> <code>{filename}</code>\n\n"
-                        f"<b>👤 User:</b> {message.from_user.first_name} [<code>{message.from_user.id}</code>]\n"
+                        f"<b>👤 User:</b> {user.first_name} [<code>{user.id}</code>]\n"
                         f"<i>⚡ Connecting to high-speed server...</i>"
                     ),
-                    parse_mode=enums.ParseMode.HTML
+                    parse_mode=enums.ParseMode.HTML,
+                    has_spoiler=True
                 )
                 
-                # Remove thumbnail file
                 os.remove(thumb_path)
             else:
                 await rocket_msg.edit_text(
                     f"<b>📥 Starting Download:</b> <code>{filename}</code>\n\n"
-                    f"<b>👤 User:</b> {message.from_user.first_name} [<code>{message.from_user.id}</code>]\n"
+                    f"<b>👤 User:</b> {user.first_name} [<code>{user.id}</code>]\n"
                     f"<i>⚡ Connecting to high-speed server...</i>",
                     parse_mode=enums.ParseMode.HTML
                 )
@@ -627,7 +620,7 @@ async def handle_link(client, message):
             logger.error(f"Error sending thumbnail: {e}")
             await rocket_msg.edit_text(
                 f"<b>📥 Starting Download:</b> <code>{filename}</code>\n\n"
-                f"<b>👤 User:</b> {message.from_user.first_name} [<code>{message.from_user.id}</code>]\n"
+                f"<b>👤 User:</b> {user.first_name} [<code>{user.id}</code>]\n"
                 f"<i>⚡ Connecting to high-speed server...</i>",
                 parse_mode=enums.ParseMode.HTML
             )
@@ -639,16 +632,20 @@ async def handle_link(client, message):
             try:
                 await progress_msg.edit_text(
                     progress_text + 
-                    f"\n\n<b>👤 User:</b> {message.from_user.first_name} [<code>{message.from_user.id}</code>]",
+                    f"\n\n<b>👤 User:</b> {user.first_name} [<code>{user.id}</code>]",
                     parse_mode=enums.ParseMode.HTML
                 )
             except Exception as e:
                 logger.error(f"Progress update error: {e}")
         
         # Download file
+        user_download_tasks[user.id] = asyncio.create_task(
+            download_with_retry(dl_url, temp_path, update_progress, user.id)
+        )
+        
         try:
             start_time = time.time()
-            size = await download_with_retry(dl_url, temp_path, update_progress, message.from_user.id)
+            size = await user_download_tasks[user.id]
             download_time = time.time() - start_time
             
             # Upload to Telegram
@@ -657,12 +654,12 @@ async def handle_link(client, message):
                 f"<b>File:</b> <code>{filename}</code>\n"
                 f"<b>Size:</b> {size/(1024*1024):.1f}MB\n"
                 f"<b>Download Time:</b> {download_time:.1f}s\n\n"
-                f"<b>👤 User:</b> {message.from_user.first_name} [<code>{message.from_user.id}</code>]",
+                f"<b>👤 User:</b> {user.first_name} [<code>{user.id}</code>]",
                 parse_mode=enums.ParseMode.HTML
             )
             
             # Send to dump channel first
-            await send_to_dump_channel(temp_path, filename, size, duration, download_time, message.from_user, thumbnail)
+            await send_to_dump_channel(temp_path, filename, size, duration, download_time, user, thumbnail)
             
             # Send to user
             await app.send_video(
@@ -694,6 +691,7 @@ async def handle_link(client, message):
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
+            user_download_tasks.pop(user.id, None)
                 
     except Exception as e:
         logger.error(f"Error: {str(e)}")
@@ -702,6 +700,7 @@ async def handle_link(client, message):
             f"<i>{str(e)}</i>",
             parse_mode=enums.ParseMode.HTML
         )
+        user_download_tasks.pop(user.id, None)
 
 async def cleanup_expired_verifications():
     while True:
@@ -716,10 +715,8 @@ async def cleanup_expired_verifications():
         await asyncio.sleep(3600)  # Run every hour
 
 async def main():
-    # Start cleanup task
     asyncio.create_task(cleanup_expired_verifications())
     
-    # Notify admin about bot starting
     try:
         await app.start()
         print("Bot started successfully")
