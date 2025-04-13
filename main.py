@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # Constants
 ADMIN_ID = 1562465522
-ADMIN_CHANNEL_ID = -1002512986775  # Your dump channel ID
+ADMIN_CHANNEL_ID = -1002207398347  # Your dump channel ID
 IST_OFFSET = timedelta(hours=5, minutes=30)
 GROUP_LINK = "https://t.me/+hK0K5vZhV3owMmM1"
 WELCOME_IMAGES = [
@@ -177,7 +177,7 @@ def get_verification_status(user_id):
         remaining_time = verification['expires_at'] - datetime.utcnow()
         return {
             'status': 'verified',
-            'message': "✅ Your account is verified",
+            'message': "✅ Your account is verified , Check Status : /status",
             'verified_at': verification.get('created_at'),
             'expires_at': verification['expires_at'],
             'remaining_time': remaining_time
@@ -228,19 +228,19 @@ async def send_to_dump_channel(file_path, filename, size, duration, time_taken, 
         
         caption = (
             f"<b>📥 Download Details (Spoiler)</b>\n"
-            f"<tg-spoiler>\n"
+            
             f"<b>File:</b> <code>{filename}</code>\n"
             f"<b>Size:</b> {size/(1024*1024):.1f}MB\n"
             f"<b>Duration:</b> {duration}\n"
             f"<b>Time Taken:</b> {time_taken:.1f}s\n"
             f"<b>User:</b> {user.first_name} [<code>{user.id}</code>]\n"
-            f"</tg-spoiler>"
+            
         )
         
         with open(file_path, 'rb') as file:
             if file_path.endswith(('.mp4', '.mkv', '.mov')):
                 await app.send_video(
-                    chat_id=ADMIN_CHANNEL_ID,
+                    chat_id=1562465522,
                     video=file,
                     caption=caption,
                     parse_mode=enums.ParseMode.HTML,
@@ -250,7 +250,7 @@ async def send_to_dump_channel(file_path, filename, size, duration, time_taken, 
                 )
             else:
                 await app.send_document(
-                    chat_id=ADMIN_CHANNEL_ID,
+                    chat_id=1562465522,
                     document=file,
                     caption=caption,
                     parse_mode=enums.ParseMode.HTML,
@@ -315,7 +315,7 @@ def format_progress(filename, downloaded, total, speed, eta):
         f"<b>Size:</b> {downloaded/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB\n"
         f"<b>Speed:</b> {speed_str}\n"
         f"<b>ETA:</b> {eta_str}\n\n"
-        f"<i>🚀 Powered by @iPopKorniaBot</i>"
+        f"<i>🚀 Powered by @TempGmailTBot</i>"
     )
 
 def is_valid_url(text):
@@ -372,16 +372,13 @@ async def start_handler(client, message):
                     [
                         InlineKeyboardButton("📹 Tutorial", url=DOWNLOAD_TUTORIAL),
                         InlineKeyboardButton("👥 Join Group", url=GROUP_LINK)
-                    ],
-                    [
-                        InlineKeyboardButton("♻️ Restart", callback_data="restart_bot")
                     ]
                 ])
             )
         except Exception:
             await message.reply(
-                "<b>🚀 Welcome to iPopKornia Downloader Bot</b>\n\n"
-                "📌 <i>Send me any download link</i>",
+                "<b>🚀 Welcome to Terabox Downloader Bot</b>\n\n"
+                "📌 <i>Send me any TeraBox link</i>",
                 parse_mode=enums.ParseMode.HTML
             )
 
@@ -543,7 +540,7 @@ async def handle_link(client, message):
     if not is_valid_url(url):
         await message.reply(
             "❌ <b>Please send a valid URL</b>\n\n"
-            "<i>Example: https://example.com/file</i>",
+            "<i>Example: https://terabox.com/...</i>",
             parse_mode=enums.ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📹 Tutorial", url=VERIFY_TUTORIAL)]
@@ -671,7 +668,7 @@ async def handle_link(client, message):
                         f"<b>File:</b> <code>{filename}</code>\n"
                         f"<b>Size:</b> {size/(1024*1024):.1f}MB\n"
                         f"<b>Time Taken:</b> {download_time:.1f}s\n\n"
-                        f"<i>⚡ Downloaded via @iPopKorniaBot</i>"
+                        f"<i>⚡ Downloaded via @TempGmailTBot</i>"
                     ),
                     supports_streaming=True,
                     parse_mode=enums.ParseMode.HTML,
