@@ -68,7 +68,7 @@ MONGODB_URI = os.getenv("MONGODB_URI")
 LINK4EARN_API = os.getenv("LINK4EARN_API")
 
 # MongoDB Initialization
-def initialize_mongodb():
+
 def initialize_mongodb():
     try:
         mongo_client = MongoClient(MONGODB_URI)
@@ -81,7 +81,6 @@ def initialize_mongodb():
         users_collection.create_index([('user_id', 1)], unique=True)
         
         # Handle verifications_collection indexes
-        # Check and recreate expires_at index if needed
         verification_indexes = verifications_collection.index_information()
         if 'expires_at_1' in verification_indexes:
             existing_index = verification_indexes['expires_at_1']
@@ -113,6 +112,7 @@ try:
     mongo_client, db, downloads_collection, verifications_collection, users_collection = initialize_mongodb()
 except Exception as e:
     logger.error(f"Critical MongoDB initialization error: {e}")
+    # Add retry logic or exit gracefully
     exit(1)
 
 # Helper functions
