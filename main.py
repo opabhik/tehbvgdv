@@ -69,6 +69,7 @@ LINK4EARN_API = os.getenv("LINK4EARN_API")
 
 # MongoDB Initialization
 def initialize_mongodb():
+def initialize_mongodb():
     try:
         mongo_client = MongoClient(MONGODB_URI)
         db = mongo_client.get_database("telegram_bot")
@@ -76,11 +77,31 @@ def initialize_mongodb():
         verifications_collection = db.verifications
         downloads_collection = db.downloads
         
-        # Create indexes
+        # Create indexes for users_collection
         users_collection.create_index([('user_id', 1)], unique=True)
+        
+        # Handle verifications_collection indexes
+        # Check and recreate expires_at index if needed
+        verification_indexes = verifications_collection.index_information()
+        if 'expires_at_1' in verification_indexes:
+            existing_index = verification_indexes['expires_at_1']
+            if existing_index.get('expireAfterSeconds') != 0:
+                verifications_collection.drop_index('expires_at_1')
+                verifications_collection.create_index(
+                    [('expires_at', 1)],
+                    expireAfterSeconds=0,
+                    name='expires_at_1'
+                )
+        else:
+            verifications_collection.create_index(
+                [('expires_at', 1)],
+                expireAfterSeconds=0,
+                name='expires_at_1'
+            )
+        
+        # Other indexes
         verifications_collection.create_index([('user_id', 1)], unique=True)
         verifications_collection.create_index([('token', 1)])
-        verifications_collection.create_index([('expires_at', 1)], expireAfterSeconds=0)
         downloads_collection.create_index([('user_id', 1)])
         
         return mongo_client, db, downloads_collection, verifications_collection, users_collection
@@ -88,7 +109,6 @@ def initialize_mongodb():
     except Exception as e:
         logger.error(f"Failed to initialize MongoDB: {e}")
         raise
-
 try:
     mongo_client, db, downloads_collection, verifications_collection, users_collection = initialize_mongodb()
 except Exception as e:
@@ -615,15 +635,16 @@ async def handle_link(client, message):
                     f"<i>⚡ Connecting to high-speed server...</i>",
                     parse_mode=enums.ParseMode.HTML
                 )
-                progress_msg = rocket_msg
-        except Exception as e:
-            logger.error(f"Error sending thumbnail: {e}")
-            await rocket_msg.edit_text(
-                f"<b>📥 Starting Download:</b> <code>{filename}</code>\n\n"
-                f"<b>👤 User:</b> {user.first_name} [<code>{user.id}</code>]\n"
-                f"<i>⚡ Connecting to high-speed server...</i>",
-                parse_mode=enums.ParseMode.HTML
-            )
+                progress_msg = await message.reply_photo(
+    photo=thumb_path,
+    caption=(
+        f"<b>📥 Starting Download:</b> <code>{filename}</code>\n\n"
+        f"<b>👤 User:</b> {user.first_name} [<code>{user.id}</code>]\n"
+        f"<i>⚡ Connecting to high-speed server...</i>"
+    ),
+    parse_mode=enums.ParseMode.HTML,
+    has_spoiler=True  # Ensure this is present
+                )
             progress_msg = rocket_msg
         
         # Update with progress
@@ -661,21 +682,22 @@ async def handle_link(client, message):
             # Send to dump channel first
             await send_to_dump_channel(temp_path, filename, size, duration, download_time, user, thumbnail)
             
-            # Send to user
-            await app.send_video(
-                chat_id=message.chat.id,
-                video=temp_path,
-                caption=(
-                    f"✅ <b>Download Complete!</b>\n\n"
-                    f"<b>File:</b> <code>{filename}</code>\n"
-                    f"<b>Size:</b> {size/(1024*1024):.1f}MB\n"
-                    f"<b>Time Taken:</b> {download_time:.1f}s\n\n"
-                    f"<i>⚡ Downloaded via @iPopKorniaBot</i>"
-                ),
-                supports_streaming=True,
-                parse_mode=enums.ParseMode.HTML,
-                reply_to_message_id=message.id
-            )
+            # When sending the video to the user
+await app.send_video(
+    chat_id=message.chat.id,
+    video=temp_path,
+    caption=(
+        f"✅ <b>Download Complete!</b>\n\n"
+        f"<b>File:</b> <code>{filename}</code>\n"
+        f"<b>Size:</b> {size/(1024*1024):.1f}MB\n"
+        f"<b>Time Taken:</b> {download_time:.1f}s\n\n"
+        f"<i>⚡ Downloaded via @iPopKorniaBot</i>"
+    ),
+    supports_streaming=True,
+    parse_mode=enums.ParseMode.HTML,
+    reply_to_message_id=message.id,
+    has_spoiler=True  # Add this line
+)
             
             await progress_msg.delete()
             
