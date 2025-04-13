@@ -68,8 +68,6 @@ MONGODB_URI = os.getenv("MONGODB_URI")
 LINK4EARN_API = os.getenv("LINK4EARN_API")
 
 # MongoDB Initialization
-
-# MongoDB Initialization
 def initialize_mongodb():
     try:
         mongo_client = MongoClient(MONGODB_URI)
@@ -435,7 +433,7 @@ async def status_handler(client, message):
     if status['status'] != 'verified':
         buttons.append([InlineKeyboardButton("📹 Verify Tutorial", url=VERIFY_TUTORIAL)])
     buttons.append([InlineKeyboardButton("👥 Join Group", url=GROUP_LINK)])
-    buttons.append([InlineKeyboardButton("♻�� Restart", callback_data="restart_bot")])
+    buttons.append([InlineKeyboardButton("♻️ Restart", callback_data="restart_bot")])
     
     await message.reply(
         response,
@@ -636,19 +634,9 @@ async def handle_link(client, message):
                     f"<i>⚡ Connecting to high-speed server...</i>",
                     parse_mode=enums.ParseMode.HTML
                 )
-                progress_msg = await message.reply_photo(
-    photo=thumb_path,
-    caption=(
-        f"<b>📥 Starting Download:</b> <code>{filename}</code>\n\n"
-        f"<b>👤 User:</b> {user.first_name} [<code>{user.id}</code>]\n"
-        f"<i>⚡ Connecting to high-speed server...</i>"
-    ),
-    parse_mode=enums.ParseMode.HTML,
-    has_spoiler=True  # Ensure this is present
-                )
-            progress_msg = rocket_msg
+                progress_msg = rocket_msg
         
-        # Update with progress
+        # Define progress callback
         async def update_progress(downloaded, total, speed, eta):
             progress_text = format_progress(filename, downloaded, total, speed, eta)
             try:
@@ -683,22 +671,22 @@ async def handle_link(client, message):
             # Send to dump channel first
             await send_to_dump_channel(temp_path, filename, size, duration, download_time, user, thumbnail)
             
-            # When sending the video to the user
-await app.send_video(
-    chat_id=message.chat.id,
-    video=temp_path,
-    caption=(
-        f"✅ <b>Download Complete!</b>\n\n"
-        f"<b>File:</b> <code>{filename}</code>\n"
-        f"<b>Size:</b> {size/(1024*1024):.1f}MB\n"
-        f"<b>Time Taken:</b> {download_time:.1f}s\n\n"
-        f"<i>⚡ Downloaded via @iPopKorniaBot</i>"
-    ),
-    supports_streaming=True,
-    parse_mode=enums.ParseMode.HTML,
-    reply_to_message_id=message.id,
-    has_spoiler=True  # Add this line
-)
+            # Send to user
+            await app.send_video(
+                chat_id=message.chat.id,
+                video=temp_path,
+                caption=(
+                    f"✅ <b>Download Complete!</b>\n\n"
+                    f"<b>File:</b> <code>{filename}</code>\n"
+                    f"<b>Size:</b> {size/(1024*1024):.1f}MB\n"
+                    f"<b>Time Taken:</b> {download_time:.1f}s\n\n"
+                    f"<i>⚡ Downloaded via @iPopKorniaBot</i>"
+                ),
+                supports_streaming=True,
+                parse_mode=enums.ParseMode.HTML,
+                reply_to_message_id=message.id,
+                has_spoiler=True
+            )
             
             await progress_msg.delete()
             
