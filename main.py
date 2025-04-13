@@ -649,15 +649,26 @@ async def handle_link(client, message):
                 logger.error(f"Progress update error: {e}")
         
         # Download file
-        user_download_tasks[user.id] = asyncio.create_task(
-            download_with_retry(dl_url, temp_path, update_progress, user.id)
+        # Download file
+async def update_progress(downloaded, total, speed, eta):
+    progress_text = format_progress(filename, downloaded, total, speed, eta)
+    try:
+        await progress_msg.edit_text(
+            progress_text + 
+            f"\n\n<b>👤 User:</b> {user.first_name} [<code>{user.id}</code>]",
+            parse_mode=enums.ParseMode.HTML
         )
-        
-        try:
-            start_time = time.time()
-            size = await user_download_tasks[user.id]
-            download_time = time.time() - start_time
-            
+    except Exception as e:
+        logger.error(f"Progress update error: {e}")
+
+try:
+    user_download_tasks[user.id] = asyncio.create_task(
+        download_with_retry(dl_url, temp_path, update_progress, user.id)
+    )
+
+    start_time = time.time()
+    size = await user_download_tasks[user.id]
+    download_time = time.time() - start_time
             # Upload to Telegram
             await progress_msg.edit_text(
                 "📤 <b>Uploading to Telegram...</b>\n\n"
