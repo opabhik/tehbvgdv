@@ -634,9 +634,103 @@ async def handle_link(client, message):
                     f"<i>⚡ Connecting to high-speed server...</i>",
                     parse_mode=enums.ParseMode.HTML
                 )
-                progress_msg = rocket_msg
+@app.on_message(filters.text & ~filters.command(["start", "status", "restart", "broadcast"]))
+async def handle_link(client, message):
+    user = message.from_user
+    url = message.text.strip()
+    
+    if not is_valid_url(url):
+        await message.reply(
+            "❌ <b>Please send a valid URL</b>\n\n"
+            "<i>Example: https://example.com/file</i>",
+            parse_mode=enums.ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📹 Tutorial", url=VERIFY_TUTORIAL)]
+            ])
+        )
+        return
+    
+    if user.id in user_download_tasks:
+        await message.reply(
+            "⏳ <b>You already have a download in progress</b>\n\n"
+            "Please wait for it to complete or use /restart to cancel it",
+            parse_mode=enums.ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("♻️ Restart", callback_data="restart_bot")]
+            ])
+        )
+        return
+    
+    user_status = get_verification_status(user.id)
+    if user_status['status'] != 'verified':
+        verification_link = await create_verification_link(user.id)
+        await message.reply(
+            "🔒 <b>Verification Required</b>\n\n"
+            "<i>Please verify to access download features</i>",
+            parse_mode=enums.ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔗 Verify Now", url=verification_link)],
+                [InlineKeyboardButton("📹 Tutorial", url=VERIFY_TUTORIAL)]
+            ])
+        )
+        return
+    
+    rocket_msg = await message.reply("🚀")
+    
+    try:
+        try:
+            api_url = f"https://true12g.in/api/terabox.php?url={url}"
+            api_response = requests.get(api_url, timeout=15).json()
+            
+            if not api_response.get('response'):
+                await rocket_msg.edit_text("❌ <b>Invalid link or content not available</b>", parse_mode=enums.ParseMode.HTML)
+                return
+                
+            file_info = api_response['response'][0]
+            dl_url = file_info['resolutions'].get('HD Video')
+            thumbnail = file_info.get('thumbnail', '')
+            title = file_info.get('title', url.split('/')[-1][:50])
+            duration = file_info.get('duration', 'N/A')
+            ext = mimetypes.guess_extension(requests.head(dl_url).headers.get('content-type', '')) or '.mp4'
+            filename = f"{title[:50]}{ext}"
+            temp_path = f"temp_{user.id}_{int(time.time())}{ext}"
+            
+        except Exception as e:
+            logger.error(f"API request failed: {str(e)}")
+            await rocket_msg.edit_text("❌ <b>Failed to fetch download info</b>", parse_mode=enums.ParseMode.HTML)
+            return
         
-        # Define progress callback
+        try:
+            if thumbnail:
+                thumb_path = f"thumb_{user.id}.jpg"
+                with requests.get(thumbnail, stream=True, timeout=10) as r:
+                    r.raise_for_status()
+                    with open(thumb_path, 'wb') as f:
+                        for chunk in r.iter_content(1024):
+                            f.write(chunk)
+                
+                await rocket_msg.delete()
+                progress_msg = await message.reply_photo(
+                    photo=thumb_path,
+                    caption=(
+                        f"<b>📥 Starting Download:</b> <code>{filename}</code>\n\n"
+                        f"<b>👤 User:</b> {user.first_name} [<code>{user.id}</code>]\n"
+                        f"<i>⚡ Connecting to high-speed server...</i>"
+                    ),
+                    parse_mode=enums.ParseMode.HTML,
+                    has_spoiler=True
+                )
+                os.remove(thumb_path)
+            else:
+                await rocket_msg.edit_text(
+                    f"<b>📥 Starting Download:</b> <code>{filename}</code>\n\n"
+                    f"<b>👤 User:</b> {user.first_name} [<code>{user.id}</code>]\n"
+                    f"<i>⚡ Connecting to high-speed server...</i>",
+                    parse_mode=enums.ParseMode.HTML
+                )
+                progress_msg = rocket_msg
+
+        # Define progress callback outside try block
         async def update_progress(downloaded, total, speed, eta):
             progress_text = format_progress(filename, downloaded, total, speed, eta)
             try:
@@ -647,29 +741,16 @@ async def handle_link(client, message):
                 )
             except Exception as e:
                 logger.error(f"Progress update error: {e}")
-        
-        # Download file
-        # Download file
-async def update_progress(downloaded, total, speed, eta):
-    progress_text = format_progress(filename, downloaded, total, speed, eta)
-    try:
-        await progress_msg.edit_text(
-            progress_text + 
-            f"\n\n<b>👤 User:</b> {user.first_name} [<code>{user.id}</code>]",
-            parse_mode=enums.ParseMode.HTML
-        )
-    except Exception as e:
-        logger.error(f"Progress update error: {e}")
 
-try:
-    user_download_tasks[user.id] = asyncio.create_task(
-        download_with_retry(dl_url, temp_path, update_progress, user.id)
-    )
+        try:
+            user_download_tasks[user.id] = asyncio.create_task(
+                download_with_retry(dl_url, temp_path, update_progress, user.id)
+            )
 
-    start_time = time.time()
-    size = await user_download_tasks[user.id]
-    download_time = time.time() - start_time
-            # Upload to Telegram
+            start_time = time.time()
+            size = await user_download_tasks[user.id]
+            download_time = time.time() - start_time
+            
             await progress_msg.edit_text(
                 "📤 <b>Uploading to Telegram...</b>\n\n"
                 f"<b>File:</b> <code>{filename}</code>\n"
@@ -679,10 +760,8 @@ try:
                 parse_mode=enums.ParseMode.HTML
             )
             
-            # Send to dump channel first
             await send_to_dump_channel(temp_path, filename, size, duration, download_time, user, thumbnail)
             
-            # Send to user
             await app.send_video(
                 chat_id=message.chat.id,
                 video=temp_path,
