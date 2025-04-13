@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # Constants
 ADMIN_ID = 1562465522
-ADMIN_CHANNEL_ID = -1002512986775  # Your admin channel ID
+ADMIN_CHANNEL_ID = -1002512986775  # Your dump channel ID
 IST_OFFSET = timedelta(hours=5, minutes=30)
 GROUP_LINK = "https://t.me/+hK0K5vZhV3owMmM1"
 WELCOME_IMAGES = [
@@ -240,29 +240,62 @@ async def notify_admin_new_user(user):
     except Exception as e:
         logger.error(f"Admin notify error: {e}")
 
-async def send_to_admin_channel(filename, size, duration, time_taken, user):
+async def send_to_dump_channel(file_path, filename, size, duration, time_taken, user, thumbnail_url=None):
     try:
-        # Upload file directly to admin channel with details in caption
+        # Download thumbnail if available
+        thumbnail_path = None
+        if thumbnail_url:
+            try:
+                thumbnail_path = f"thumb_{user.id}.jpg"
+                with requests.get(thumbnail_url, stream=True, timeout=10) as r:
+                    r.raise_for_status()
+                    with open(thumbnail_path, 'wb') as f:
+                        for chunk in r.iter_content(1024):
+                            f.write(chunk)
+            except Exception as e:
+                logger.error(f"Error downloading thumbnail: {e}")
+                thumbnail_path = None
+        
+        # Prepare caption with spoiler
         caption = (
-            f"<b>📥 New Download</b>\n\n"
+            f"<b>📥 Download Details (Spoiler)</b>\n"
+            f"<tg-spoiler>\n"
             f"<b>File:</b> <code>{filename}</code>\n"
             f"<b>Size:</b> {size/(1024*1024):.1f}MB\n"
             f"<b>Duration:</b> {duration}\n"
-            f"<b>Time Taken:</b> {time_taken:.1f}s\n\n"
-            f"<b>User:</b> {user.first_name} [<code>{user.id}</code>]"
+            f"<b>Time Taken:</b> {time_taken:.1f}s\n"
+            f"<b>User:</b> {user.first_name} [<code>{user.id}</code>]\n"
+            f"</tg-spoiler>"
         )
         
-        with open(filename, 'rb') as file:
-            await app.send_document(
-                chat_id=ADMIN_CHANNEL_ID,
-                document=file,
-                caption=caption,
-                parse_mode=enums.ParseMode.HTML,
-                disable_notification=True  # This prevents notifications for other admins
-            )
+        # Send file to dump channel
+        with open(file_path, 'rb') as file:
+            if file_path.endswith('.mp4') or file_path.endswith('.mkv'):
+                await app.send_video(
+                    chat_id=ADMIN_CHANNEL_ID,
+                    video=file,
+                    caption=caption,
+                    parse_mode=enums.ParseMode.HTML,
+                    thumb=thumbnail_path if thumbnail_path else None,
+                    supports_streaming=True,
+                    disable_notification=True
+                )
+            else:
+                await app.send_document(
+                    chat_id=ADMIN_CHANNEL_ID,
+                    document=file,
+                    caption=caption,
+                    parse_mode=enums.ParseMode.HTML,
+                    thumb=thumbnail_path if thumbnail_path else None,
+                    disable_notification=True
+                )
+        
+        # Clean up thumbnail
+        if thumbnail_path and os.path.exists(thumbnail_path):
+            os.remove(thumbnail_path)
             
     except Exception as e:
-        logger.error(f"Error sending to admin channel: {e}")
+        logger.error(f"Error sending to dump channel: {e}")
 
 async def broadcast_message(user_ids, message):
     success = 0
@@ -302,7 +335,7 @@ async def download_with_retry(url, filename, progress_callback, user_id):
                                 elapsed = now - start_time
                                 speed = downloaded / elapsed if elapsed > 0 else 0
                                 eta = (total_size - downloaded) / speed if speed > 0 else 0
-                                await progress_callback(downloaded, total_size, speed, eta)
+                                await progress_callback(downloaded, total_size, speed, eta, filename)
                                 last_update = now
                     return total_size
             except Exception as e:
@@ -313,16 +346,18 @@ async def download_with_retry(url, filename, progress_callback, user_id):
     finally:
         active_downloads.pop(user_id, None)
 
-def format_progress(filename, downloaded, total, speed, eta):
+def format_progress(filename, downloaded, total, speed, eta, thumbnail_url=None):
     percent = (downloaded / total) * 100
     filled = int(percent / 5)
-    bar = '⬢' * filled + '⬡' * (20 - filled)
+    progress_bar = '▰' * filled + '▱' * (20 - filled)
     
     # Format speed
     if speed > 1024*1024:
         speed_str = f"{speed/(1024*1024):.2f} MB/s"
-    else:
+    elif speed > 1024:
         speed_str = f"{speed/1024:.2f} KB/s"
+    else:
+        speed_str = f"{speed:.2f} B/s"
     
     # Format ETA
     if eta > 3600:
@@ -332,14 +367,19 @@ def format_progress(filename, downloaded, total, speed, eta):
     else:
         eta_str = f"{int(eta)}s"
     
-    return (
+    # Format size
+    size_str = f"{downloaded/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB"
+    
+    progress_text = (
         f"<b>📥 Downloading:</b> <code>{filename}</code>\n\n"
-        f"<b>Progress:</b> {bar} {percent:.1f}%\n"
-        f"<b>Size:</b> {downloaded/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB\n"
+        f"<b>Progress:</b> {progress_bar} {percent:.1f}%\n"
+        f"<b>Size:</b> {size_str}\n"
         f"<b>Speed:</b> {speed_str}\n"
         f"<b>ETA:</b> {eta_str}\n\n"
         f"<i>🚀 Powered by @iPopKorniaBot</i>"
     )
+    
+    return progress_text
 
 def is_valid_url(text):
     # Check if text looks like a URL
@@ -559,11 +599,15 @@ async def handle_link(client, message):
         
         # Update with progress
         async def update_progress(downloaded, total, speed, eta):
-            await progress_msg.edit_text(
-                format_progress(filename, downloaded, total, speed, eta) +
-                f"\n\n<b>👤 User:</b> {message.from_user.first_name} [<code>{message.from_user.id}</code>]",
-                parse_mode=enums.ParseMode.HTML
-            )
+            progress_text = format_progress(filename, downloaded, total, speed, eta, thumbnail)
+            try:
+                await progress_msg.edit_text(
+                    progress_text + 
+                    f"\n\n<b>👤 User:</b> {message.from_user.first_name} [<code>{message.from_user.id}</code>]",
+                    parse_mode=enums.ParseMode.HTML
+                )
+            except Exception as e:
+                logger.error(f"Progress update error: {e}")
         
         # Download file
         try:
@@ -581,8 +625,8 @@ async def handle_link(client, message):
                 parse_mode=enums.ParseMode.HTML
             )
             
-            # Send file directly to admin channel with details in caption
-            await send_to_admin_channel(temp_path, size, duration, download_time, message.from_user)
+            # Send to dump channel first
+            await send_to_dump_channel(temp_path, filename, size, duration, download_time, message.from_user, thumbnail)
             
             # Send to user
             await app.send_video(
