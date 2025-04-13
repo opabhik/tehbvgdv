@@ -24,9 +24,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 ADMIN_ID = 1562465522
 IST_OFFSET = timedelta(hours=5, minutes=30)  # IST is UTC+5:30
 GROUP_LINK = "https://t.me/+hK0K5vZhV3owMmM1"
-LOADING_STICKERS = [
-    "CAACAgUAAxkBAAICrmcLfBNpxMV_A4j59womoatTkTlHAAIEAAPBJDExieUdbguzyBA2BA"
-]
 WELCOME_IMAGES = [
     "https://envs.sh/5OQ.jpg",
     "https://envs.sh/5OK.jpg",
@@ -221,7 +218,7 @@ async def process_queue():
             logger.error(f"Queue processing error: {e}")
             await asyncio.sleep(10)
 
-async def download_file(url, filename, progress_callback=None, cancel_flag=None):
+async def download_file(url, filename, progress_callback=None):
     try:
         with requests.get(url, stream=True, timeout=60) as r:
             r.raise_for_status()
@@ -233,9 +230,6 @@ async def download_file(url, filename, progress_callback=None, cancel_flag=None)
                 last_update = time.time()
 
                 for chunk in r.iter_content(1024 * 1024):  # 1MB chunks
-                    if cancel_flag and cancel_flag.is_set():
-                        raise asyncio.CancelledError("Download cancelled by user")
-                    
                     if chunk:
                         f.write(chunk)
                         downloaded += len(chunk)
@@ -377,56 +371,14 @@ async def system_stats_callback(client, callback_query: CallbackQuery):
         logger.error(f"Error in system stats callback: {e}")
         await callback_query.answer("❌ Error fetching system stats", show_alert=True)
 
-@app.on_callback_query(filters.regex("^check_status$"))
-async def check_status_callback(client, callback_query: CallbackQuery):
-    try:
-        user_stats = get_user_stats(callback_query.from_user.id)
-        if user_stats['verification_status']:
-            await callback_query.answer(
-                f"✅ Verified (Expires: {format_ist_time(user_stats['verification_status']['expires_at'])})",
-                show_alert=True
-            )
-        else:
-            verification_link = await create_verification_link(callback_query.from_user.id)
-            await callback_query.answer(
-                "❌ You are not verified yet. Please verify first when you try to download.",
-                show_alert=True
-            )
-            await callback_query.message.reply(
-                "🔒 You need to verify before downloading:",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ Verify Now", url=verification_link)]
-                ])
-            )
-    except Exception as e:
-        logger.error(f"Error in check status callback: {e}")
-        await callback_query.answer("❌ Error checking status", show_alert=True)
-
-@app.on_callback_query(filters.regex("^cancel_download_"))
-async def cancel_download_callback(client, callback_query: CallbackQuery):
-    try:
-        download_id = callback_query.data.split("_")[2]
-        downloads_collection.update_one(
-            {'download_id': download_id},
-            {'$set': {'status': 'cancelled'}}
-        )
-        await callback_query.answer("Download cancellation requested")
-        await callback_query.edit_message_text("❌ Download cancelled by user")
-    except Exception as e:
-        logger.error(f"Error in cancel download callback: {e}")
-        await callback_query.answer("❌ Error cancelling download", show_alert=True)
-
 async def handle_download(user, url, is_from_queue=False):
     message = user.message if hasattr(user, 'message') else None
-    loading_sticker_msg = None
-    progress_msg = None
-    download_id = secrets.token_hex(4)
+    status_msg = None
     
     try:
-        # Send loading sticker
-        loading_sticker = random.choice(LOADING_STICKERS)
+        # Send initial status message
         if message:
-            loading_sticker_msg = await message.reply_sticker(loading_sticker)
+            status_msg = await message.reply("🔍 Fetching download link...")
 
         # Fetch video info
         api = f"https://true12g.in/api/terabox.php?url={url}"
@@ -445,25 +397,21 @@ async def handle_download(user, url, is_from_queue=False):
         filename = f"{title[:50]}{ext}"
         temp_path = f"temp_{filename}"
 
-        # Delete loading sticker and send thumbnail with progress
-        if message and loading_sticker_msg:
+        # Delete status message and send thumbnail with progress
+        if message and status_msg:
             try:
-                await loading_sticker_msg.delete()
+                await status_msg.delete()
             except Exception:
                 pass
 
             # Send thumbnail with initial progress
-            cancel_button = InlineKeyboardButton(
-                "❌ Cancel Download", 
-                callback_data=f"cancel_download_{download_id}"
-            )
             progress_msg = await message.reply_photo(
                 thumbnail,
-                caption="🔄 Starting download... 0%",
-                reply_markup=InlineKeyboardMarkup([[cancel_button]])
+                caption="🔄 Starting download... 0%"
             )
 
         # Add to active downloads
+        download_id = secrets.token_hex(4)
         downloads_collection.insert_one({
             'user_id': user.id,
             'filename': filename,
@@ -473,49 +421,55 @@ async def handle_download(user, url, is_from_queue=False):
             'download_id': download_id
         })
 
-        # Download with cancel support
-        cancel_flag = asyncio.Event()
-        
+        # Download with progress updates
         async def progress_callback(dl, total, spd, eta):
             if message and progress_msg:
                 percent = (dl / total) * 100 if total else 0
                 bar = "⬢" * int(percent / 5) + "⬡" * (20 - int(percent / 5))
                 text = (
-                    f"⬇️ `{filename}`\n"
+                    f"⬇️ Downloading: `{filename}`\n"
                     f"{bar} {percent:.1f}%\n"
                     f"⚡ {spd:.1f} MB/s • ⏳ {eta:.0f}s\n"
                     f"📦 {dl/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB"
                 )
                 try:
-                    await progress_msg.edit_caption(
-                        caption=text,
-                        reply_markup=InlineKeyboardMarkup([[cancel_button]])
-                    )
+                    await progress_msg.edit_caption(caption=text)
                 except Exception as e:
                     logger.error(f"Progress update error: {e}")
 
         try:
-            size = await download_file(dl_url, temp_path, progress_callback, cancel_flag)
+            size = await download_file(dl_url, temp_path, progress_callback)
             
             if message and progress_msg:
                 await progress_msg.edit_caption("📤 Uploading to Telegram...")
                 await message.reply_chat_action(enums.ChatAction.UPLOAD_VIDEO)
+
+            # Upload progress callback
+            async def upload_progress(current, total):
+                if message and progress_msg:
+                    percent = (current / total) * 100
+                    text = (
+                        f"📤 Uploading: `{filename}`\n"
+                        f"⬢{'⬢' * int(percent / 5)}{'⬡' * (20 - int(percent / 5))} {percent:.1f}%\n"
+                        f"📦 {current/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB"
+                    )
+                    try:
+                        await progress_msg.edit_caption(caption=text)
+                    except Exception:
+                        pass
 
             await app.send_video(
                 chat_id=user.id,
                 video=temp_path,
                 caption=f"✅ Upload complete!\nSize: {size / (1024 * 1024):.1f}MB",
                 supports_streaming=True,
-                reply_to_message_id=message.id if message else None
+                reply_to_message_id=message.id if message else None,
+                progress=upload_progress
             )
 
             if message and progress_msg:
                 await progress_msg.delete()
 
-        except asyncio.CancelledError:
-            if message:
-                await message.reply("❌ Download cancelled successfully.")
-            return
         except Exception as e:
             logger.error(f"Download error: {e}")
             if message:
@@ -533,9 +487,9 @@ async def handle_download(user, url, is_from_queue=False):
         logger.error(f"Error: {e}")
         if message:
             await message.reply(f"❌ Error: {e}")
-        if loading_sticker_msg:
+        if status_msg:
             try:
-                await loading_sticker_msg.delete()
+                await status_msg.delete()
             except Exception:
                 pass
 
