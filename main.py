@@ -646,13 +646,37 @@ async def handle_link(client, message):
             thumbnail = file_info.get('thumbnail', '')
             title = file_info.get('title', url.split('/')[-1][:50])
             duration = file_info.get('duration', 'N/A')
+            file_size = int(file_info.get('size', 0))  # Get size from API response
             ext = mimetypes.guess_extension(requests.head(dl_url).headers.get('content-type', '')) or '.mp4'
             filename = f"{title[:50]}{ext}"
             temp_path = f"temp_{user.id}_{int(time.time())}{ext}"
             
-            # Get file size before downloading
-            head_response = requests.head(dl_url)
-            file_size = int(head_response.headers.get('content-length', 0))
+            # Check file size before proceeding
+            if file_size > MAX_UPLOAD_SIZE:
+                await rocket_msg.delete()
+                online_stream_url = f"https://opabhik.serv00.net/Watch.php?url={dl_url}"
+                
+                await message.reply(
+                    f"📁 <b>File is too large for Telegram upload ({file_size/(1024*1024):.1f}MB > 100MB)</b>\n\n"
+                    f"<b>File Name:</b> <code>{filename}</code>\n"
+                    f"<b>Size:</b> {file_size/(1024*1024):.1f}MB\n\n"
+                    "🔗 <b>Download Links:</b>\n"
+                    f"1. <a href='{dl_url}'>Direct Download Link</a>\n"
+                    f"2. <a href='{online_stream_url}'>Online Stream Link</a>\n\n"
+                    "<i>⚠️ Note: Large files can't be uploaded directly to Telegram</i>",
+                    parse_mode=enums.ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    reply_markup=InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("📥 Direct Download", url=dl_url),
+                            InlineKeyboardButton("▶️ Online Stream", url=online_stream_url)
+                        ],
+                        [
+                            InlineKeyboardButton("👥 Join Group", url=GROUP_LINK)
+                        ]
+                    ])
+                )
+                return
             
         except Exception as e:
             logger.error(f"API request failed: {str(e)}")
@@ -711,7 +735,7 @@ async def handle_link(client, message):
                 download_time = time.time() - start_time
                 
                 await progress_msg.edit_text(
-                    "📤 <b>Processing file...</b>\n\n"
+                    "📤 <b>Uploading to Telegram...</b>\n\n"
                     f"<b>File:</b> <code>{filename}</code>\n"
                     f"<b>Size:</b> {size/(1024*1024):.1f}MB\n"
                     f"<b>Download Time:</b> {download_time:.1f}s\n\n"
@@ -721,48 +745,21 @@ async def handle_link(client, message):
                 
                 await send_to_dump_channel(temp_path, filename, size, duration, download_time, user, thumbnail)
                 
-                # Check file size and decide whether to upload or send links
-                if size > MAX_UPLOAD_SIZE:
-                    # File is too large for Telegram upload, send download links
-                    online_stream_url = f"https://opabhik.serv00.net/Watch.php?url={dl_url}"
-                    
-                    await message.reply(
-                        f"📁 <b>File is too large for Telegram upload ({size/(1024*1024):.1f}MB > 100MB)</b>\n\n"
-                        f"<b>File Name:</b> <code>{filename}</code>\n"
-                        f"<b>Size:</b> {size/(1024*1024):.1f}MB\n\n"
-                        "🔗 <b>Download Links:</b>\n"
-                        f"1. <a href='{dl_url}'>Direct Download Link</a>\n"
-                        f"2. <a href='{online_stream_url}'>Online Stream Link</a>\n\n"
-                        "<i>⚠️ Note: Large files can't be uploaded directly to Telegram</i>",
-                        parse_mode=enums.ParseMode.HTML,
-                        disable_web_page_preview=True,
-                        reply_markup=InlineKeyboardMarkup([
-                            [
-                                InlineKeyboardButton("📥 Direct Download", url=dl_url),
-                                InlineKeyboardButton("▶️ Online Stream", url=online_stream_url)
-                            ],
-                            [
-                                InlineKeyboardButton("👥 Join Group", url=GROUP_LINK)
-                            ]
-                        ])
-                    )
-                else:
-                    # File is small enough, upload directly
-                    await app.send_video(
-                        chat_id=message.chat.id,
-                        video=temp_path,
-                        caption=(
-                            f"✅ <b>Download Complete!</b>\n\n"
-                            f"<b>File:</b> <code>{filename}</code>\n"
-                            f"<b>Size:</b> {size/(1024*1024):.1f}MB\n"
-                            f"<b>Time Taken:</b> {download_time:.1f}s\n\n"
-                            f"<i>⚡ Downloaded via @TempGmailTBot</i>"
-                        ),
-                        supports_streaming=True,
-                        parse_mode=enums.ParseMode.HTML,
-                        reply_to_message_id=message.id,
-                        has_spoiler=True
-                    )
+                await app.send_video(
+                    chat_id=message.chat.id,
+                    video=temp_path,
+                    caption=(
+                        f"✅ <b>Download Complete!</b>\n\n"
+                        f"<b>File:</b> <code>{filename}</code>\n"
+                        f"<b>Size:</b> {size/(1024*1024):.1f}MB\n"
+                        f"<b>Time Taken:</b> {download_time:.1f}s\n\n"
+                        f"<i>⚡ Downloaded via @TempGmailTBot</i>"
+                    ),
+                    supports_streaming=True,
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_to_message_id=message.id,
+                    has_spoiler=True
+                )
                 
                 await progress_msg.delete()
                 
@@ -797,7 +794,6 @@ async def handle_link(client, message):
             f"<i>{str(e)}</i>",
             parse_mode=enums.ParseMode.HTML
         )
-
 # [Rest of the code remains the same]
 
 async def cleanup_expired_verifications():
