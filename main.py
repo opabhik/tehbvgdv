@@ -33,6 +33,7 @@ MAX_RETRIES = 2
 CHUNK_SIZE = 4 * 1024 * 1024  # 4MB chunks for faster download
 VERIFY_TUTORIAL = "https://t.me/True12G_offical/96"
 DOWNLOAD_TUTORIAL = "https://t.me/Eagle_Looterz/3189"
+MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100MB
 
 # Global variables
 active_downloads = {}
@@ -51,7 +52,6 @@ def start_dummy_server():
     server.serve_forever()
 
 threading.Thread(target=start_dummy_server, daemon=True).start()
-
 # Logging
 logging.basicConfig(
     level=logging.INFO,
@@ -156,7 +156,7 @@ async def create_verification_link(user_id):
         'used': False
     })
     
-    deep_link = f"https://telegram.me/iPopKorniaBot?start=verify-{token}"
+    deep_link = f"https://telegram.me/TeraboxDownloader_5Bot?start=verify-{token}"
     return await shorten_url(deep_link)
 
 async def shorten_url(url):
@@ -227,7 +227,7 @@ async def send_to_dump_channel(file_path, filename, size, duration, time_taken, 
                 thumbnail_path = None
         
         caption = (
-            f"<b>📥 Download Details (Spoiler)</b>\n"
+            f"<b>📥 Download Details</b>\n"
             
             f"<b>File:</b> <code>{filename}</code>\n"
             f"<b>Size:</b> {size/(1024*1024):.1f}MB\n"
@@ -240,7 +240,7 @@ async def send_to_dump_channel(file_path, filename, size, duration, time_taken, 
         with open(file_path, 'rb') as file:
             if file_path.endswith(('.mp4', '.mkv', '.mov')):
                 await app.send_video(
-                    chat_id=1562465522,
+                    chat_id=-1002301352491,
                     video=file,
                     caption=caption,
                     parse_mode=enums.ParseMode.HTML,
@@ -250,7 +250,7 @@ async def send_to_dump_channel(file_path, filename, size, duration, time_taken, 
                 )
             else:
                 await app.send_document(
-                    chat_id=1562465522,
+                    chat_id=-1002301352491,
                     document=file,
                     caption=caption,
                     parse_mode=enums.ParseMode.HTML,
@@ -532,6 +532,63 @@ async def restart_handler(client, message):
             parse_mode=enums.ParseMode.HTML
         )
 
+#!/usr/bin/env python3
+import os
+import time
+import mimetypes
+import asyncio
+import logging
+import requests
+import threading
+import secrets
+import random
+import re
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+from pymongo import MongoClient
+from pyrogram import Client, filters, enums
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import BadRequest, FloodWait
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+# Constants
+ADMIN_ID = 1562465522
+ADMIN_CHANNEL_ID = -1002207398347  # Your dump channel ID
+IST_OFFSET = timedelta(hours=5, minutes=30)
+GROUP_LINK = "https://t.me/+hK0K5vZhV3owMmM1"
+WELCOME_IMAGES = [
+    "https://envs.sh/5OQ.jpg",
+    "https://envs.sh/5OK.jpg",
+    "https://envs.sh/zmX.jpg",
+    "https://envs.sh/zm6.jpg"
+]
+DOWNLOAD_TIMEOUT = 45
+MAX_RETRIES = 2
+CHUNK_SIZE = 4 * 1024 * 1024  # 4MB chunks for faster download
+VERIFY_TUTORIAL = "https://t.me/True12G_offical/96"
+DOWNLOAD_TUTORIAL = "https://t.me/Eagle_Looterz/3189"
+MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100MB
+
+# Global variables
+active_downloads = {}
+user_download_tasks = {}
+broadcast_posts = {}
+
+# Dummy HTTP healthcheck server
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+def start_dummy_server():
+    server = HTTPServer(("0.0.0.0", 8000), HealthCheckHandler)
+    server.serve_forever()
+
+threading.Thread(target=start_dummy_server, daemon=True).start()
+
+# [Previous helper functions remain the same until handle_link]
+
 @app.on_message(filters.text & ~filters.command(["start", "status", "restart", "broadcast"]))
 async def handle_link(client, message):
     user = message.from_user
@@ -593,6 +650,10 @@ async def handle_link(client, message):
             filename = f"{title[:50]}{ext}"
             temp_path = f"temp_{user.id}_{int(time.time())}{ext}"
             
+            # Get file size before downloading
+            head_response = requests.head(dl_url)
+            file_size = int(head_response.headers.get('content-length', 0))
+            
         except Exception as e:
             logger.error(f"API request failed: {str(e)}")
             await rocket_msg.edit_text("❌ <b>Failed to fetch download info</b>", parse_mode=enums.ParseMode.HTML)
@@ -650,7 +711,7 @@ async def handle_link(client, message):
                 download_time = time.time() - start_time
                 
                 await progress_msg.edit_text(
-                    "📤 <b>Uploading to Telegram...</b>\n\n"
+                    "📤 <b>Processing file...</b>\n\n"
                     f"<b>File:</b> <code>{filename}</code>\n"
                     f"<b>Size:</b> {size/(1024*1024):.1f}MB\n"
                     f"<b>Download Time:</b> {download_time:.1f}s\n\n"
@@ -660,21 +721,48 @@ async def handle_link(client, message):
                 
                 await send_to_dump_channel(temp_path, filename, size, duration, download_time, user, thumbnail)
                 
-                await app.send_video(
-                    chat_id=message.chat.id,
-                    video=temp_path,
-                    caption=(
-                        f"✅ <b>Download Complete!</b>\n\n"
-                        f"<b>File:</b> <code>{filename}</code>\n"
-                        f"<b>Size:</b> {size/(1024*1024):.1f}MB\n"
-                        f"<b>Time Taken:</b> {download_time:.1f}s\n\n"
-                        f"<i>⚡ Downloaded via @TempGmailTBot</i>"
-                    ),
-                    supports_streaming=True,
-                    parse_mode=enums.ParseMode.HTML,
-                    reply_to_message_id=message.id,
-                    has_spoiler=True
-                )
+                # Check file size and decide whether to upload or send links
+                if size > MAX_UPLOAD_SIZE:
+                    # File is too large for Telegram upload, send download links
+                    online_stream_url = f"https://opabhik.serv00.net/Watch.php?url={dl_url}"
+                    
+                    await message.reply(
+                        f"📁 <b>File is too large for Telegram upload ({size/(1024*1024):.1f}MB > 100MB)</b>\n\n"
+                        f"<b>File Name:</b> <code>{filename}</code>\n"
+                        f"<b>Size:</b> {size/(1024*1024):.1f}MB\n\n"
+                        "🔗 <b>Download Links:</b>\n"
+                        f"1. <a href='{dl_url}'>Direct Download Link</a>\n"
+                        f"2. <a href='{online_stream_url}'>Online Stream Link</a>\n\n"
+                        "<i>⚠️ Note: Large files can't be uploaded directly to Telegram</i>",
+                        parse_mode=enums.ParseMode.HTML,
+                        disable_web_page_preview=True,
+                        reply_markup=InlineKeyboardMarkup([
+                            [
+                                InlineKeyboardButton("📥 Direct Download", url=dl_url),
+                                InlineKeyboardButton("▶️ Online Stream", url=online_stream_url)
+                            ],
+                            [
+                                InlineKeyboardButton("👥 Join Group", url=GROUP_LINK)
+                            ]
+                        ])
+                    )
+                else:
+                    # File is small enough, upload directly
+                    await app.send_video(
+                        chat_id=message.chat.id,
+                        video=temp_path,
+                        caption=(
+                            f"✅ <b>Download Complete!</b>\n\n"
+                            f"<b>File:</b> <code>{filename}</code>\n"
+                            f"<b>Size:</b> {size/(1024*1024):.1f}MB\n"
+                            f"<b>Time Taken:</b> {download_time:.1f}s\n\n"
+                            f"<i>⚡ Downloaded via @TempGmailTBot</i>"
+                        ),
+                        supports_streaming=True,
+                        parse_mode=enums.ParseMode.HTML,
+                        reply_to_message_id=message.id,
+                        has_spoiler=True
+                    )
                 
                 await progress_msg.delete()
                 
@@ -709,6 +797,8 @@ async def handle_link(client, message):
             f"<i>{str(e)}</i>",
             parse_mode=enums.ParseMode.HTML
         )
+
+# [Rest of the code remains the same]
 
 async def cleanup_expired_verifications():
     while True:
