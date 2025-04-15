@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+
 import os
 import time
 import mimetypes
@@ -16,7 +16,7 @@ from pyrogram import Client, filters, enums
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import BadRequest, FloodWait
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+
 # Constants
 ADMIN_ID = 1562465522
 ADMIN_CHANNEL_ID = -1002207398347  # Your dump channel ID
@@ -33,7 +33,6 @@ MAX_RETRIES = 2
 CHUNK_SIZE = 4 * 1024 * 1024  # 4MB chunks for faster download
 VERIFY_TUTORIAL = "https://t.me/True12G_offical/96"
 DOWNLOAD_TUTORIAL = "https://t.me/Eagle_Looterz/3189"
-MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100MB
 
 # Global variables
 active_downloads = {}
@@ -52,6 +51,7 @@ def start_dummy_server():
     server.serve_forever()
 
 threading.Thread(target=start_dummy_server, daemon=True).start()
+
 # Logging
 logging.basicConfig(
     level=logging.INFO,
@@ -532,86 +532,39 @@ async def restart_handler(client, message):
             parse_mode=enums.ParseMode.HTML
         )
 
-#!/usr/bin/env python3
-import os
-import time
-import mimetypes
-import asyncio
-import logging
-import requests
-import threading
-import secrets
-import random
-import re
-from datetime import datetime, timedelta
-from dotenv import load_dotenv
-from pymongo import MongoClient
-from pyrogram import Client, filters, enums
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import BadRequest, FloodWait
-from http.server import BaseHTTPRequestHandler, HTTPServer
-
-# Constants
-ADMIN_ID = 1562465522
-ADMIN_CHANNEL_ID = -1002207398347  # Your dump channel ID
-IST_OFFSET = timedelta(hours=5, minutes=30)
-GROUP_LINK = "https://t.me/+hK0K5vZhV3owMmM1"
-WELCOME_IMAGES = [
-    "https://envs.sh/5OQ.jpg",
-    "https://envs.sh/5OK.jpg",
-    "https://envs.sh/zmX.jpg",
-    "https://envs.sh/zm6.jpg"
-]
-DOWNLOAD_TIMEOUT = 45
-MAX_RETRIES = 2
-CHUNK_SIZE = 4 * 1024 * 1024  # 4MB chunks for faster download
-VERIFY_TUTORIAL = "https://t.me/True12G_offical/96"
-DOWNLOAD_TUTORIAL = "https://t.me/Eagle_Looterz/3189"
-MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100MB
-
-# Global variables
-active_downloads = {}
-user_download_tasks = {}
-broadcast_posts = {}
-
-# Dummy HTTP healthcheck server
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-def start_dummy_server():
-    server = HTTPServer(("0.0.0.0", 8000), HealthCheckHandler)
-    server.serve_forever()
-
-threading.Thread(target=start_dummy_server, daemon=True).start()
-
-# [Previous helper functions remain the same until handle_link]
-
-
-
 @app.on_message(filters.text & ~filters.command(["start", "status", "restart", "broadcast"]))
 async def handle_link(client, message):
     user = message.from_user
-    original_url = message.text.strip()
+    url = message.text.strip()
     
-    if not is_valid_url(original_url):
+    if not is_valid_url(url):
         await message.reply(
-            "❌ <b>Invalid URL</b>\nSend a valid Terabox link",
+            "❌ <b>Please send a valid URL</b>\n\n"
+            "<i>Example: https://terabox.com/...</i>",
             parse_mode=enums.ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📹 Tutorial", url=VERIFY_TUTORIAL)]
             ])
         )
         return
-
-    # Verification check
+    
+    if user.id in user_download_tasks:
+        await message.reply(
+            "⏳ <b>You already have a download in progress</b>\n\n"
+            "Please wait for it to complete or use /restart to cancel it",
+            parse_mode=enums.ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("♻️ Restart", callback_data="restart_bot")]
+            ])
+        )
+        return
+    
     user_status = get_verification_status(user.id)
     if user_status['status'] != 'verified':
         verification_link = await create_verification_link(user.id)
         await message.reply(
-            "🔒 <b>Verification Required</b>",
+            "🔒 <b>Verification Required</b>\n\n"
+            "<i>Please verify to access download features</i>",
             parse_mode=enums.ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔗 Verify Now", url=verification_link)],
@@ -619,106 +572,143 @@ async def handle_link(client, message):
             ])
         )
         return
-
-    msg = await message.reply("🔍 <b>Processing link...</b>", parse_mode=enums.ParseMode.HTML)
-
+    
+    rocket_msg = await message.reply("🚀")
+    
     try:
-        # API call to get download info
-        api_url = f"https://true12g.in/api/terabox.php?url={original_url}"
-        api_response = requests.get(api_url, timeout=15).json()
-        
-        if not api_response.get('response'):
-            await msg.edit_text("❌ <b>Invalid link or content unavailable</b>")
-            return
-            
-        file_info = api_response['response'][0]
-        dl_url = file_info['resolutions'].get('HD Video')
-        filename = file_info.get('title', "file")[:50] + ".mp4"
-        
-        # Create webapp URL with original user link
-        webapp_url = f"https://opabhik.serv00.net/Watch.php?url={original_url}"
-        
-        # Get file size
         try:
-            head = requests.head(dl_url, timeout=10)
-            file_size = int(head.headers.get('content-length', 0))
-        except:
-            file_size = 0
-
-        # Prepare buttons
-        buttons = [
-            [InlineKeyboardButton("📥 Direct Download", url=dl_url),
-             InlineKeyboardButton("▶️ Watch Online", web_app=WebAppInfo(url=webapp_url))],
-            [InlineKeyboardButton("👥 Join Group", url=GROUP_LINK)]
-        ]
-
-        # If file >100MB, send only links
-        if file_size > MAX_UPLOAD_SIZE:
-            await msg.edit_text(
-                f"📁 <b>File Too Large</b> ({file_size/(1024*1024):.1f}MB)\n"
-                "Use the links below:",
-                reply_markup=InlineKeyboardMarkup(buttons)
-            )
-            return
-
-        # For files <100MB
-        temp_path = f"temp_{user.id}.mp4"
-        await msg.edit_text(
-            f"📥 <b>Downloading:</b> <code>{filename}</code>\n"
-            f"📦 <b>Size:</b> {file_size/(1024*1024):.1f}MB\n\n"
-            "<i>You can watch while downloading:</i>",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("▶️ Watch Now", web_app=WebAppInfo(url=webapp_url))]
-            ])
-        )
-
-        # Download progress callback
-        async def update_progress(downloaded, total):
-            percent = downloaded/total*100
-            await msg.edit_text(
-                f"📥 <b>Downloading:</b> {percent:.1f}%\n"
-                f"⚡ {downloaded/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB\n\n"
-                "<i>You can watch while downloading:</i>",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("▶️ Watch Now", web_app=WebAppInfo(url=webapp_url))]
-                ])
-            )
-
-        # Download file
-        try:
-            await download_with_retry(dl_url, temp_path, update_progress, user.id)
+            api_url = f"https://true12g.in/api/terabox.php?url={url}"
+            api_response = requests.get(api_url, timeout=15).json()
             
-            # Upload to Telegram
-            await message.reply_video(
-                video=temp_path,
-                caption=f"✅ <b>Download Complete!</b>\n<code>{filename}</code>",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("▶️ Watch Again", web_app=WebAppInfo(url=webapp_url))]
-                ])
-            )
-            await msg.delete()
-
+            if not api_response.get('response'):
+                await rocket_msg.edit_text("❌ <b>Invalid link or content not available</b>", parse_mode=enums.ParseMode.HTML)
+                return
+                
+            file_info = api_response['response'][0]
+            dl_url = file_info['resolutions'].get('HD Video')
+            thumbnail = file_info.get('thumbnail', '')
+            title = file_info.get('title', url.split('/')[-1][:50])
+            duration = file_info.get('duration', 'N/A')
+            ext = mimetypes.guess_extension(requests.head(dl_url).headers.get('content-type', '')) or '.mp4'
+            filename = f"{title[:50]}{ext}"
+            temp_path = f"temp_{user.id}_{int(time.time())}{ext}"
+            
         except Exception as e:
-            await msg.edit_text(
-                f"❌ <b>Error:</b> {str(e)}\n\n"
-                "<i>You can still watch the file:</i>",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("▶️ Watch Now", web_app=WebAppInfo(url=webapp_url))]
-                ])
+            logger.error(f"API request failed: {str(e)}")
+            await rocket_msg.edit_text("❌ <b>Failed to fetch download info</b>", parse_mode=enums.ParseMode.HTML)
+            return
+        
+        try:
+            if thumbnail:
+                thumb_path = f"thumb_{user.id}.jpg"
+                with requests.get(thumbnail, stream=True, timeout=10) as r:
+                    r.raise_for_status()
+                    with open(thumb_path, 'wb') as f:
+                        for chunk in r.iter_content(1024):
+                            f.write(chunk)
+                
+                await rocket_msg.delete()
+                progress_msg = await message.reply_photo(
+                    photo=thumb_path,
+                    caption=(
+                        f"<b>📥 Starting Download:</b> <code>{filename}</code>\n\n"
+                        f"<b>👤 User:</b> {user.first_name} [<code>{user.id}</code>]\n"
+                        f"<i>⚡ Connecting to high-speed server...</i>"
+                    ),
+                    parse_mode=enums.ParseMode.HTML,
+                    has_spoiler=True
+                )
+                os.remove(thumb_path)
+            else:
+                await rocket_msg.edit_text(
+                    f"<b>📥 Starting Download:</b> <code>{filename}</code>\n\n"
+                    f"<b>👤 User:</b> {user.first_name} [<code>{user.id}</code>]\n"
+                    f"<i>⚡ Connecting to high-speed server...</i>",
+                    parse_mode=enums.ParseMode.HTML
+                )
+                progress_msg = rocket_msg
+
+            # Define progress callback
+            async def update_progress(downloaded, total, speed, eta):
+                progress_text = format_progress(filename, downloaded, total, speed, eta)
+                try:
+                    await progress_msg.edit_text(
+                        progress_text + 
+                        f"\n\n<b>👤 User:</b> {user.first_name} [<code>{user.id}</code>]",
+                        parse_mode=enums.ParseMode.HTML
+                    )
+                except Exception as e:
+                    logger.error(f"Progress update error: {e}")
+
+            try:
+                user_download_tasks[user.id] = asyncio.create_task(
+                    download_with_retry(dl_url, temp_path, update_progress, user.id)
+                )
+
+                start_time = time.time()
+                size = await user_download_tasks[user.id]
+                download_time = time.time() - start_time
+                
+                await progress_msg.edit_text(
+                    "📤 <b>Uploading to Telegram...</b>\n\n"
+                    f"<b>File:</b> <code>{filename}</code>\n"
+                    f"<b>Size:</b> {size/(1024*1024):.1f}MB\n"
+                    f"<b>Download Time:</b> {download_time:.1f}s\n\n"
+                    f"<b>👤 User:</b> {user.first_name} [<code>{user.id}</code>]",
+                    parse_mode=enums.ParseMode.HTML
+                )
+                
+                await send_to_dump_channel(temp_path, filename, size, duration, download_time, user, thumbnail)
+                
+                await app.send_video(
+                    chat_id=message.chat.id,
+                    video=temp_path,
+                    caption=(
+                        f"✅ <b>Download Complete!</b>\n\n"
+                        f"<b>File:</b> <code>{filename}</code>\n"
+                        f"<b>Size:</b> {size/(1024*1024):.1f}MB\n"
+                        f"<b>Time Taken:</b> {download_time:.1f}s\n\n"
+                        f"<i>⚡ Downloaded via @TempGmailTBot</i>"
+                    ),
+                    supports_streaming=True,
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_to_message_id=message.id,
+                    has_spoiler=True
+                )
+                
+                await progress_msg.delete()
+                
+            except asyncio.CancelledError:
+                await progress_msg.edit_text("❌ <b>Download cancelled</b>", parse_mode=enums.ParseMode.HTML)
+            except Exception as e:
+                logger.error(f"Download failed: {str(e)}")
+                await progress_msg.edit_text(
+                    "❌ <b>Download failed</b>\n\n"
+                    f"<i>Error: {str(e)}</i>",
+                    parse_mode=enums.ParseMode.HTML
+                )
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                user_download_tasks.pop(user.id, None)
+                
+        except Exception as e:
+            logger.error(f"Error: {str(e)}")
+            await message.reply(
+                "❌ <b>An error occurred</b>\n\n"
+                f"<i>{str(e)}</i>",
+                parse_mode=enums.ParseMode.HTML
             )
-        finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
-
+            user_download_tasks.pop(user.id, None)
     except Exception as e:
-        await msg.edit_text(
-            f"❌ <b>Error:</b> {str(e)}\n\n"
-            "<i>Try again or use direct links:</i>",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Try Again", callback_data=f"retry_{original_url}")]
-            ])
+        logger.error(f"Error in handle_link: {str(e)}")
+        await message.reply(
+            "❌ <b>An unexpected error occurred</b>\n\n"
+            f"<i>{str(e)}</i>",
+            parse_mode=enums.ParseMode.HTML
         )
-# [Rest of the code remains the same]
 
 async def cleanup_expired_verifications():
     while True:
