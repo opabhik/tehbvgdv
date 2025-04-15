@@ -589,8 +589,7 @@ threading.Thread(target=start_dummy_server, daemon=True).start()
 
 # [Previous helper functions remain the same until handle_link]
 
-
-      @app.on_message(filters.text & ~filters.command(["start", "status", "restart", "broadcast"]))
+@app.on_message(filters.text & ~filters.command(["start", "status", "restart", "broadcast"]))
 async def handle_link(client, message):
     user = message.from_user
     url = message.text.strip()
