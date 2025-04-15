@@ -592,9 +592,9 @@ threading.Thread(target=start_dummy_server, daemon=True).start()
 @app.on_message(filters.text & ~filters.command(["start", "status", "restart", "broadcast"]))
 async def handle_link(client, message):
     user = message.from_user
-    url = message.text.strip()
+    original_url = message.text.strip()  # Store original user URL
     
-    if not is_valid_url(url):
+    if not is_valid_url(original_url):
         await message.reply(
             "❌ <b>Please send a valid URL</b>\n\n"
             "<i>Example: https://terabox.com/...</i>",
@@ -630,77 +630,100 @@ async def handle_link(client, message):
         )
         return
     
-    rocket_msg = await message.reply("🚀")
+    processing_msg = await message.reply("🔍 <b>Processing your link...</b>", parse_mode=enums.ParseMode.HTML)
     
     try:
         try:
-            api_url = f"https://true12g.in/api/terabox.php?url={url}"
+            api_url = f"https://true12g.in/api/terabox.php?url={original_url}"
             api_response = requests.get(api_url, timeout=15).json()
             
             if not api_response.get('response'):
-                await rocket_msg.edit_text("❌ <b>Invalid link or content not available</b>", parse_mode=enums.ParseMode.HTML)
+                await processing_msg.edit_text("❌ <b>Invalid link or content not available</b>", parse_mode=enums.ParseMode.HTML)
                 return
                 
             file_info = api_response['response'][0]
             dl_url = file_info['resolutions'].get('HD Video')
             thumbnail = file_info.get('thumbnail', '')
-            title = file_info.get('title', url.split('/')[-1][:50])
+            title = file_info.get('title', original_url.split('/')[-1][:50])
             duration = file_info.get('duration', 'N/A')
             ext = mimetypes.guess_extension(requests.head(dl_url).headers.get('content-type', '')) or '.mp4'
             filename = f"{title[:50]}{ext}"
+            
+            # Create webapp watch link with original user URL
+            webapp_url = f"https://opabhik.serv00.net/Watch.php?url={original_url}"
+            
+            # Get file size from headers
+            head_response = requests.head(dl_url)
+            file_size = int(head_response.headers.get('content-length', 0))
+            
+            # If file is >100MB, send only links
+            if file_size > MAX_UPLOAD_SIZE:
+                await processing_msg.edit_text(
+                    f"📁 <b>File is too large for Telegram upload ({file_size/(1024*1024):.1f}MB > 100MB)</b>\n\n"
+                    f"<b>File Name:</b> <code>{filename}</code>\n"
+                    f"<b>Size:</b> {file_size/(1024*1024):.1f}MB\n\n"
+                    "<i>Please use the links below:</i>",
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("📥 Direct Download", url=dl_url),
+                            InlineKeyboardButton("▶️ Watch Online", web_app=WebAppInfo(url=webapp_url))
+                        ],
+                        [
+                            InlineKeyboardButton("👥 Join Group", url=GROUP_LINK)
+                        ]
+                    ])
+                )
+                return
+                
+            # For files <100MB, proceed with download
             temp_path = f"temp_{user.id}_{int(time.time())}{ext}"
             
-            # Generate watch link immediately
-            online_stream_url = f"https://opabhik.serv00.net/Watch.php?url={dl_url}"
-            
-            # Send immediate links to user
-            await rocket_msg.delete()
-            initial_msg = await message.reply(
+            await processing_msg.edit_text(
                 f"🔗 <b>Instant Access Links</b>\n\n"
-                f"<b>File:</b> <code>{filename}</code>\n\n"
-                "You can download or watch immediately while we process the file:\n"
-                f"1. <a href='{dl_url}'>Direct Download Link</a>\n"
-                f"2. <a href='{online_stream_url}'>Online Stream Link</a>\n\n"
-                "<i>⏳ Processing file for Telegram upload...</i>",
+                f"<b>File:</b> <code>{filename}</code>\n"
+                f"<b>Size:</b> {file_size/(1024*1024):.1f}MB\n\n"
+                "<i>Starting download process...</i>",
                 parse_mode=enums.ParseMode.HTML,
-                disable_web_page_preview=True,
                 reply_markup=InlineKeyboardMarkup([
                     [
                         InlineKeyboardButton("📥 Direct Download", url=dl_url),
-                        InlineKeyboardButton("▶️ Online Stream", url=online_stream_url)
-                    ],
-                    [
-                        InlineKeyboardButton("👥 Join Group", url=GROUP_LINK)
+                        InlineKeyboardButton("▶️ Watch Online", web_app=WebAppInfo(url=webapp_url))
                     ]
                 ])
             )
             
-        except Exception as e:
-            logger.error(f"API request failed: {str(e)}")
-            await rocket_msg.edit_text("❌ <b>Failed to fetch download info</b>", parse_mode=enums.ParseMode.HTML)
-            return
-        
-        try:
-            # Start download process in background
+            # Start download process
             progress_msg = await message.reply(
-                f"<b>📥 Starting Download:</b> <code>{filename}</code>\n\n"
-                f"<b>👤 User:</b> {user.first_name} [<code>{user.id}</code>]\n"
-                f"<i>⚡ Connecting to high-speed server...</i>\n\n"
-                f"<a href='{online_stream_url}'>▶️ Watch Now</a>",
+                f"<b>📥 Downloading:</b> <code>{filename}</code>\n\n"
+                f"<b>Size:</b> {file_size/(1024*1024):.1f}MB\n"
+                f"<b>Status:</b> Starting...\n\n"
+                f"<i>You can watch while downloading:</i>",
                 parse_mode=enums.ParseMode.HTML,
-                disable_web_page_preview=True
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("▶️ Watch Now", web_app=WebAppInfo(url=webapp_url))]
+                ])
             )
 
-            # Define progress callback
+            # Progress callback
             async def update_progress(downloaded, total, speed, eta):
-                progress_text = format_progress(filename, downloaded, total, speed, eta)
+                percent = (downloaded / total) * 100
+                progress_bar = '▓' * int(percent / 10) + '░' * (10 - int(percent / 10))
+                speed_str = f"{speed/(1024*1024):.2f} MB/s" if speed > 1024*1024 else f"{speed/1024:.2f} KB/s"
+                eta_str = f"{int(eta//3600)}h {int((eta%3600)//60)}m" if eta > 3600 else f"{int(eta//60)}m {int(eta%60)}s" if eta > 60 else f"{int(eta)}s"
+                
                 try:
                     await progress_msg.edit_text(
-                        progress_text + 
-                        f"\n\n<b>👤 User:</b> {user.first_name} [<code>{user.id}</code>]\n"
-                        f"<a href='{online_stream_url}'>▶️ Watch Now</a>",
+                        f"<b>📥 Downloading:</b> <code>{filename}</code>\n\n"
+                        f"<b>Progress:</b> [{progress_bar}] {percent:.2f}%\n"
+                        f"<b>Size:</b> {downloaded/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB\n"
+                        f"<b>Speed:</b> {speed_str}\n"
+                        f"<b>ETA:</b> {eta_str}\n\n"
+                        f"<i>You can watch while downloading:</i>",
                         parse_mode=enums.ParseMode.HTML,
-                        disable_web_page_preview=True
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("▶️ Watch Now", web_app=WebAppInfo(url=webapp_url))]
+                        ])
                     )
                 except Exception as e:
                     logger.error(f"Progress update error: {e}")
@@ -711,77 +734,63 @@ async def handle_link(client, message):
                 )
 
                 start_time = time.time()
-                size = await user_download_tasks[user.id]
+                final_size = await user_download_tasks[user.id]
                 download_time = time.time() - start_time
-                
-                # Check if file is too large after download
-                if size > MAX_UPLOAD_SIZE:
-                    await progress_msg.edit_text(
-                        f"📁 <b>File is too large for Telegram upload ({size/(1024*1024):.1f}MB > 100MB)</b>\n\n"
-                        f"<b>File Name:</b> <code>{filename}</code>\n"
-                        f"<b>Size:</b> {size/(1024*1024):.1f}MB\n\n"
-                        "🔗 <b>Please use these links:</b>\n"
-                        f"1. <a href='{dl_url}'>Direct Download Link</a>\n"
-                        f"2. <a href='{online_stream_url}'>Online Stream Link</a>\n\n"
-                        "<i>⚠️ Note: Large files can't be uploaded directly to Telegram</i>",
-                        parse_mode=enums.ParseMode.HTML,
-                        disable_web_page_preview=True,
-                        reply_markup=InlineKeyboardMarkup([
-                            [
-                                InlineKeyboardButton("📥 Direct Download", url=dl_url),
-                                InlineKeyboardButton("▶️ Online Stream", url=online_stream_url)
-                            ]
-                        ])
-                    )
-                    return
                 
                 await progress_msg.edit_text(
                     "📤 <b>Uploading to Telegram...</b>\n\n"
                     f"<b>File:</b> <code>{filename}</code>\n"
-                    f"<b>Size:</b> {size/(1024*1024):.1f}MB\n"
+                    f"<b>Size:</b> {final_size/(1024*1024):.1f}MB\n"
                     f"<b>Download Time:</b> {download_time:.1f}s\n\n"
-                    f"<a href='{online_stream_url}'>▶️ Watch Now</a>",
+                    f"<i>You can watch while waiting:</i>",
                     parse_mode=enums.ParseMode.HTML,
-                    disable_web_page_preview=True
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("▶️ Watch Now", web_app=WebAppInfo(url=webapp_url))]
+                    ])
                 )
                 
-                await send_to_dump_channel(temp_path, filename, size, duration, download_time, user, thumbnail)
+                await send_to_dump_channel(temp_path, filename, final_size, duration, download_time, user, thumbnail)
                 
+                # Upload to Telegram
                 await app.send_video(
                     chat_id=message.chat.id,
                     video=temp_path,
                     caption=(
                         f"✅ <b>Download Complete!</b>\n\n"
                         f"<b>File:</b> <code>{filename}</code>\n"
-                        f"<b>Size:</b> {size/(1024*1024):.1f}MB\n"
+                        f"<b>Size:</b> {final_size/(1024*1024):.1f}MB\n"
                         f"<b>Time Taken:</b> {download_time:.1f}s\n\n"
                         f"<i>⚡ Downloaded via @TempGmailTBot</i>"
                     ),
                     supports_streaming=True,
                     parse_mode=enums.ParseMode.HTML,
                     reply_to_message_id=message.id,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("▶️ Watch Again", web_app=WebAppInfo(url=webapp_url))]
+                    ]),
                     has_spoiler=True
                 )
                 
                 await progress_msg.delete()
                 
             except asyncio.CancelledError:
-                await progress_msg.edit_text("❌ <b>Download cancelled</b>", parse_mode=enums.ParseMode.HTML)
+                await progress_msg.edit_text(
+                    "❌ <b>Download cancelled</b>\n\n"
+                    "<i>You can still watch the file:</i>",
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("▶️ Watch Now", web_app=WebAppInfo(url=webapp_url))]
+                    ])
+                )
             except Exception as e:
                 logger.error(f"Download failed: {str(e)}")
                 await progress_msg.edit_text(
                     "❌ <b>Download failed</b>\n\n"
                     f"<i>Error: {str(e)}</i>\n\n"
-                    f"You can still try the direct links:\n"
-                    f"1. <a href='{dl_url}'>Direct Download</a>\n"
-                    f"2. <a href='{online_stream_url}'>Online Stream</a>",
+                    "<i>You can still watch the file:</i>",
                     parse_mode=enums.ParseMode.HTML,
-                    disable_web_page_preview=True,
                     reply_markup=InlineKeyboardMarkup([
-                        [
-                            InlineKeyboardButton("📥 Direct Download", url=dl_url),
-                            InlineKeyboardButton("▶️ Online Stream", url=online_stream_url)
-                        ]
+                        [InlineKeyboardButton("▶️ Watch Now", web_app=WebAppInfo(url=webapp_url))]
                     ])
                 )
             finally:
@@ -791,24 +800,15 @@ async def handle_link(client, message):
                 
         except Exception as e:
             logger.error(f"Error: {str(e)}")
-            await message.reply(
+            await processing_msg.edit_text(
                 "❌ <b>An error occurred</b>\n\n"
                 f"<i>{str(e)}</i>\n\n"
-                f"You can still try the direct links:\n"
-                f"1. <a href='{dl_url}'>Direct Download</a>\n"
-                f"2. <a href='{online_stream_url}'>Online Stream</a>",
+                "<i>You can try watching directly:</i>",
                 parse_mode=enums.ParseMode.HTML,
-                disable_web_page_preview=True,
                 reply_markup=InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton("📥 Direct Download", url=dl_url),
-                        InlineKeyboardButton("▶️ Online Stream", url=online_stream_url)
-                    ]
+                    [InlineKeyboardButton("▶️ Watch Now", web_app=WebAppInfo(url=webapp_url))]
                 ])
             )
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-            user_download_tasks.pop(user.id, None)
     except Exception as e:
         logger.error(f"Error in handle_link: {str(e)}")
         await message.reply(
